@@ -1,0 +1,27 @@
+{
+  "name": "point-cloud-visualizer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WebSocket ingest and viewer server for live point cloud sessions.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "client:vlp16": "tsx src/vlp16-client.ts",
+    "client:vlp32": "tsx src/vlp32-client.ts",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.15",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}

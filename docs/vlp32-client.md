@@ -1,0 +1,89 @@
+# VLP-32 client setup
+
+This project now includes a first-pass **Velodyne VLP-32 UDP client** that listens for lidar
+packets on the host, converts them into `xyz_rgb_i_v1` point batches, and streams them into the
+point cloud server over WebSocket.
+
+## What it does today
+
+- listens for **1206-byte Velodyne UDP packets** on port `2368` by default
+- decodes **distance + intensity** samples using a **32-laser calibration file**
+- converts points into local XYZ coordinates
+- maps intensity to grayscale RGB for the current protocol
+- publishes batches into `WS /ws/ingest`
+- sends a static identity pose for v1
+
+This is the right shape for a **stationary lidar** or an initial bench setup. If you later want a
+moving rig, the next step is to replace the identity pose with odometry from another source.
+
+## Network setup
+
+The VLP-32 should be configured to send UDP packets to the host IP on the dedicated NIC connected to
+the sensor.
+
+Typical practical setup:
+
+1. Assign a static IP to the NIC connected to the lidar.
+2. Configure the lidar's destination IP to that NIC address.
+3. Keep the UDP data port at `2368` unless you intentionally change it.
+4. Run the point cloud server on the same machine or on another reachable host.
+
+Your 40G NIC is fine as the host interface. The lidar itself does not need that bandwidth, but the
+dedicated link and SSD-backed storage are both good for keeping the ingest path simple.
+
+## Calibration file
+
+The client expects a JSON calibration file with **32** entries, one per laser:
+
+```json
+{
+  "lasers": [
+    { "laserId": 0, "verticalDegrees": -25.0, "rotationalDegrees": 0.0, "distanceOffsetMeters": 0.0 },
+    { "laserId": 1, "verticalDegrees": -1.0,  "rotationalDegrees": 0.0, "distanceOffsetMeters": 0.0 }
+  ]
+}
+```
+
+Required fields:
+
+- `laserId` — integer `0..31`
+- `verticalDegrees` — vertical correction angle
+
+Optional fields:
+
+- `rotationalDegrees` — horizontal correction per laser
+- `distanceOffsetMeters` — additive range correction
+
+For accurate geometry, use values derived from the factory calibration for your actual sensor.
+
+## Running the client
+
+```bash
+npm run client:vlp32 -- \
+  --calibration-file ./vlp32-calibration.json \
+  --session-id vlp32-room-a-001 \
+  --publisher-id vlp32-main \
+  --server-url ws://localhost:8080/ws/ingest
+```
+
+Useful flags:
+
+- `--udp-port 2368`
+- `--batch-packets 10`
+- `--frame-id map`
+- `--project-id <id>`
+- `--site-id <id>`
+- `--room-id <id>`
+
+## Current limitations
+
+- pose is currently fixed to identity
+- factory XML calibration is not parsed directly yet; convert it to the JSON shape above first
+- RGB is synthesized from intensity for now
+- the packet decoder is a first pass and does not yet model every Velodyne correction nuance
+
+## Good next steps
+
+1. Add a small converter for the factory calibration format you actually have.
+2. Add a pose source interface so odometry can come from another process.
+3. Add a packet capture/replay mode for repeatable testing without the live sensor.
