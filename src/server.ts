@@ -13,6 +13,7 @@ import {
   VIEWER_ROLE,
   makeError,
   parseClientMessage,
+  type ChunkBootstrapMessage,
   type ChunkUpdateMessage,
   type ConnectionRole,
   type PointBatchHeaderMessage,
@@ -316,8 +317,10 @@ function attachViewer(ws: WebSocket, state: ConnectionState, message: ViewerJoin
   viewers.add(ws);
 
   send(ws, sessionStore.getSessionState(message.session_id));
-  for (const { header, payload, pose } of sessionStore.getPointPayloads(message.session_id)) {
-    sendChunkUpdate(ws, header, payload, pose);
+  // Bootstrap the full accumulated world cloud from disk (flushed + dirty), then the
+  // viewer receives live chunk_update deltas from here on via broadcastChunkUpdate.
+  for (const worldPoints of chunkStore.readSessionWorldChunks(message.session_id)) {
+    sendChunkBootstrap(ws, message.session_id, worldPoints);
   }
 }
 
@@ -366,6 +369,18 @@ function sendChunkUpdate(
   };
   send(ws, message);
   ws.send(payload, { binary: true });
+}
+
+function sendChunkBootstrap(ws: WebSocket, sessionId: string, worldPoints: Buffer): void {
+  const message: ChunkBootstrapMessage = {
+    type: 'chunk_bootstrap',
+    session_id: sessionId,
+    point_count: worldPoints.byteLength / POINT_STRIDE_BYTES,
+    point_format: POINT_FORMAT,
+    stride_bytes: POINT_STRIDE_BYTES,
+  };
+  send(ws, message);
+  ws.send(worldPoints, { binary: true });
 }
 
 function send(ws: WebSocket, message: ServerMessage): void {

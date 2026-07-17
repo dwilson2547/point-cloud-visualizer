@@ -74,11 +74,15 @@ const s = new THREE.Vector3(1, 1, 1);
 function ingestBatch(header, buffer) {
   const view = new DataView(buffer);
   const count = header.point_count;
-  const [tx, ty, tz] = header.pose.translation_m;
-  const [qx, qy, qz, qw] = header.pose.rotation_xyzw;
-  q.set(qx, qy, qz, qw);
-  t.set(tx, ty, tz);
-  m.compose(t, q, s);
+  // Live deltas (chunk_update) carry local-frame points + a pose; bootstrap chunks
+  // (chunk_bootstrap) are already world-frame, so transform by identity.
+  if (header.pose) {
+    q.set(...header.pose.rotation_xyzw);
+    t.set(...header.pose.translation_m);
+    m.compose(t, q, s);
+  } else {
+    m.identity();
+  }
   const e = m.elements;
 
   const startSlot = head;
@@ -122,8 +126,10 @@ function ingestBatch(header, buffer) {
   geometry.setDrawRange(0, filled);
   dirty = true;
   stats.points = filled;
-  stats.batches += 1;
-  stats.lastSeq = header.sequence;
+  if (header.type === 'chunk_update') {
+    stats.batches += 1;
+    stats.lastSeq = header.sequence;
+  }
   stats.windowPoints += count;
 }
 
@@ -158,7 +164,7 @@ function connect(sessionId) {
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'chunk_update') {
+      if (msg.type === 'chunk_update' || msg.type === 'chunk_bootstrap') {
         pendingHeader = msg; // binary payload follows next
       } else if (msg.type === 'viewer_session_state') {
         stats.batches = msg.point_batches;

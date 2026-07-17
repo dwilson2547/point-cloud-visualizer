@@ -132,12 +132,24 @@ export interface ChunkUpdateMessage {
   pose: Pose;
 }
 
+// Sent to a viewer on join, once per source chunk, to bootstrap the accumulated
+// world cloud from disk. Points are already world-frame (no pose — unlike the live
+// chunk_update deltas, which carry local-frame points plus a pose to transform by).
+export interface ChunkBootstrapMessage {
+  type: 'chunk_bootstrap';
+  session_id: string;
+  point_count: number;
+  point_format: string;
+  stride_bytes: number;
+}
+
 export type ServerMessage =
   | SessionAckMessage
   | PointBatchAckMessage
   | ErrorMessage
   | ViewerSessionStateMessage
-  | ChunkUpdateMessage;
+  | ChunkUpdateMessage
+  | ChunkBootstrapMessage;
 
 export function parseClientMessage(input: string): ClientControlMessage {
   const parsed = JSON.parse(input) as { type?: string };

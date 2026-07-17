@@ -266,6 +266,32 @@ export class ChunkStore {
       }));
   }
 
+  // Every persisted world-frame point for a session: flushed chunk files plus any
+  // not-yet-flushed dirty buffers (the two are disjoint — a flush deletes the dirty
+  // entry). Points are already world-frame, so no pose transform is needed. Returns
+  // one buffer per source chunk (empties skipped) so callers can stream the bootstrap
+  // incrementally instead of concatenating one huge blob.
+  readSessionWorldChunks(sessionId: string): Buffer[] {
+    const chunks: Buffer[] = [];
+    for (const chunk of this.listSessionChunks(sessionId)) {
+      try {
+        const data = fs.readFileSync(path.join(this.rootDir, chunk.filePath));
+        if (data.byteLength > 0) {
+          chunks.push(data);
+        }
+      } catch {
+        // Metadata can briefly lead the file on disk; skip an unreadable chunk.
+      }
+    }
+    const prefix = `${sessionId}:`;
+    for (const [key, dirty] of this.dirtyChunks) {
+      if (key.startsWith(prefix) && dirty.buffers.length > 0) {
+        chunks.push(Buffer.concat(dirty.buffers));
+      }
+    }
+    return chunks;
+  }
+
   private initializeSchema(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
