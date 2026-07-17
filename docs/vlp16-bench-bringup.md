@@ -4,9 +4,10 @@ Fast path to get a Velodyne VLP-16 streaming into a socket on a fresh host. Writ
 multi-hour bring-up on 2026-07-17 that should have taken ten minutes — the failures that ate that
 time are captured in `docs/issues/2026_07_17_*` and cross-referenced below.
 
-> **Scope.** Everything below is the **Windows** path and was *executed* on the 2026-07-17 bring-up
-> (unit #1). The **Linux** path (§6) is a stub — it will be written from the actual unit #2 Linux
-> bring-up, not from guesswork.
+> **Scope.** The **Windows** path was *executed* on the 2026-07-17 bring-up (unit #1); the **Linux**
+> path (§6) was *executed* on the unit #2 bring-up the same day. Both are from observed runs, not
+> guesswork. The signature host-side drop differs by OS: Windows firewall Public profile (§1) vs.
+> Linux `rp_filter` (§6.1).
 
 **Golden rule:** work the diagnosis in layers from the wire up, and **never trust a zero-packet
 capture without first confirming the sensor is live** (`status.json` motor `On` + NIC RX climbing).
@@ -100,6 +101,8 @@ packets=757  payload=1206 bytes  src=192.168.1.201  ~755 pps
 | Symptom | Cause | Doc |
 |---------|-------|-----|
 | Rung 4 OK, rung 5 = 0 packets (Windows) | Public profile drops inbound UDP despite allow rule | `issues/2026_07_17_windows_firewall_public_profile_drops_vlp16_udp.md` |
+| Rung 4 OK, rung 5 = 0 packets (Linux) | `rp_filter` (even loose mode 2) drops the `255.255.255.255` broadcast before the socket | `issues/2026_07_17_linux_rp_filter_drops_vlp16_broadcast.md` |
+| Intermittent 0-packet runs + "activation of network failed" popups (Linux) | NetworkManager DHCP-flushing the manual IP on `eno1` | `vlp16-bench-bringup.md` §6.1 (static NM profile) |
 | Sensor unreachable from WSL2, fine from Windows | WSL2 NAT isolates the subnet | `issues/2026_07_17_wsl2_nat_isolates_lidar_subnet.md` |
 | `motor: Disabled`, `diag.json` all zeros, RX→0 | Protective shutdown (power sag / thermal) | `issues/2026_07_17_vlp16_protective_shutdown_confounds_capture.md` |
 | Configured unicast dest reverts to broadcast after reboot | `host.addr` not persisted | `issues/2026_07_17_vlp16_host_dest_not_persisted.md` |
@@ -134,8 +137,91 @@ in minutes.
 
 ## 6. Linux host path
 
-_To be written from the unit #2 Linux bring-up (in progress). Capture the actual commands and
-observed behavior — static IP method (netplan/NetworkManager/`ip`), whether any firewall
-(`ufw`/`firewalld`/`nftables`) had to be touched, `rp_filter` behavior, broadcast vs. unicast
-reception, and the working socket/`tcpdump` verification — and replace this stub. Do not
-pre-populate with assumptions._
+Written from the **unit #2** bring-up on 2026-07-17 (Ubuntu, kernel 6.17, NIC `eno1`). Everything
+here was executed and observed on that host. **The signature failure is different from Windows: on
+Linux the host firewall was wide open and irrelevant — the silent drop was the kernel's
+`rp_filter`** (`docs/issues/2026_07_17_linux_rp_filter_drops_vlp16_broadcast.md`).
+
+### 6.1 Host network setup
+
+Two things must be true: the NIC has a static IP on the Puck's subnet, **and** it is managed so
+nothing flushes that IP mid-session.
+
+- **IP:** `192.168.1.100` · **Mask:** `255.255.255.0` · no gateway needed (point-to-point sensor link).
+
+Quick-and-dirty (does not survive NetworkManager or a replug):
+```bash
+sudo ip addr add 192.168.1.100/24 dev eno1
+sudo ip link set eno1 up
+```
+
+**Durable + stops the popups (do this).** Left alone, NetworkManager repeatedly tries to DHCP the
+sensor NIC, throws *"activation of network failed"* popups, and **flushes the manual IP mid-capture**
+— which shows up as intermittent zero-packet runs. Give it a static profile instead:
+```bash
+sudo nmcli con add type ethernet ifname eno1 con-name velodyne-vlp16 \
+  ipv4.method manual ipv4.addresses 192.168.1.100/24 ipv4.never-default yes ipv6.method disabled
+sudo nmcli con up velodyne-vlp16
+```
+`never-default yes` keeps your Wi-Fi/primary NIC as the default route. Tear down later with
+`nmcli con down velodyne-vlp16`.
+
+**The step that actually unlocks reception — disable `rp_filter`.** The Puck broadcasts to
+`255.255.255.255`; reverse-path filtering (even *loose* mode `2`, the observed default) drops the
+limited-broadcast frames at the IP layer, so `tcpdump` sees them but a bound socket gets **zero**.
+Persist it:
+```bash
+sudo tee /etc/sysctl.d/99-velodyne-lidar.conf >/dev/null <<'EOF'
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+EOF
+sudo sysctl --system
+sysctl -n net.ipv4.conf.eno1.rp_filter   # must print 0 (effective = max(all, iface))
+```
+
+Host firewall on this box needed **no changes** (`ufw` inactive, `iptables -S INPUT` = `ACCEPT`,
+`nft` had only Docker rules). Verify yours is similarly clear rather than assuming — if `ufw`/`nft`
+is active, add allow rules for `UDP/2368` and `UDP/8308` inbound.
+
+### 6.2 Verification ladder (Linux)
+
+Same layered climb as §2; stop at the first failure. Rungs 2–3 hit the sensor's platform-independent
+web API.
+
+| # | Check | Linux | Pass = |
+|---|-------|-------|--------|
+| 1 | **Link/L3** | `cat /sys/class/net/eno1/carrier` (1 = cable up); `ping 192.168.1.201` | carrier 1, link `100 Mbps`, ping replies (unit #2 answered ICMP) |
+| 2 | **Sensor alive + spinning** | `curl -s http://192.168.1.201/cgi/status.json` | `motor.state=On`, `rpm≈600`, `laser.state=On` |
+| 3 | **Health rails** | `curl -s http://192.168.1.201/cgi/diag.json` | rails non-zero, temps sane (all-zero = fault) |
+| 4 | **Packets at the NIC** | `sudo tcpdump -ni eno1 udp port 2368 -c 5` | 1206-byte frames from `192.168.1.201`, `0 dropped by kernel` |
+| 5 | **Packets in a socket** | bind `0.0.0.0:2368` (snippet below) | count > 0, payload 1206 B |
+
+**Rung 4 passes but rung 5 fails → `rp_filter` (§6.1), not the firewall.** That was the signature
+failure on this host: `tcpdump` saw the stream, the socket saw `0`, and one `rp_filter=0` flipped the
+same socket to `2261 packets in 3s`.
+
+Linux one-shot socket sniff (pure stdlib — note the `0.0.0.0` bind; binding the host's own
+`192.168.1.100` receives **nothing** for a `255.255.255.255` broadcast):
+```bash
+python3 - <<'PY'
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 2368)); s.settimeout(3)
+n = 0; t = time.time()
+try:
+    while time.time() - t < 3:
+        d, a = s.recvfrom(2048); n += 1
+        if n == 1: print("first pkt from", a, "len", len(d))
+except socket.timeout: pass
+print("received", n, "packets in 3s")
+PY
+```
+
+### 6.3 Certified-good reference (Linux)
+
+A healthy unit on this host (`rp_filter=0`, firewall untouched, static NM profile) produces:
+```
+VLP-16 Strongest | data 753 pkt/s | pos ~135 pkt/s | ~600 rpm | range 0.5-1.0 m | src 192.168.1.201
+```
+`~753 pps` single-return matches the §0 spec; `~600 rpm` is the Puck default.
