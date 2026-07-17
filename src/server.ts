@@ -1,6 +1,7 @@
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { URL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 
@@ -15,6 +16,7 @@ import {
   type ChunkUpdateMessage,
   type ConnectionRole,
   type PointBatchHeaderMessage,
+  type Pose,
   type ServerMessage,
   type ViewerJoinMessage,
 } from './protocol.js';
@@ -41,6 +43,16 @@ const chunkStore = new ChunkStore({
 const viewerSockets = new Map<string, Set<WebSocket>>();
 const ingestWss = new WebSocketServer({ noServer: true });
 const viewerWss = new WebSocketServer({ noServer: true });
+
+// Static viewer assets live in <project>/public; resolve relative to this module
+// so it works from both src/ (tsx) and dist/ (built).
+const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
+const STATIC_CONTENT_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json',
+};
 
 const server = http.createServer((req, res) => {
   if (!req.url) {
@@ -98,8 +110,41 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (serveStatic(req, res, url.pathname)) {
+    return;
+  }
+
   res.writeHead(404).end('Not found');
 });
+
+function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string): boolean {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return false;
+  }
+  const relative = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.replace(/^\/+/, ''));
+  const filePath = path.resolve(publicDir, relative);
+  // Path-traversal guard: the resolved path must stay inside publicDir.
+  if (filePath !== publicDir && !filePath.startsWith(publicDir + path.sep)) {
+    return false;
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return false;
+  }
+  if (!stat.isFile()) {
+    return false;
+  }
+  const contentType = STATIC_CONTENT_TYPES[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream';
+  res.writeHead(200, { 'content-type': contentType, 'content-length': stat.size });
+  if (req.method === 'HEAD') {
+    res.end();
+    return true;
+  }
+  fs.createReadStream(filePath).pipe(res);
+  return true;
+}
 
 server.on('upgrade', (req, socket, head) => {
   if (!req.url) {
@@ -228,7 +273,7 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
     rejected_points: 0,
   });
 
-  broadcastChunkUpdate(accepted.header, accepted.payload);
+  broadcastChunkUpdate(accepted.header, accepted.payload, accepted.pose.pose);
 }
 
 function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string): void {
@@ -271,8 +316,8 @@ function attachViewer(ws: WebSocket, state: ConnectionState, message: ViewerJoin
   viewers.add(ws);
 
   send(ws, sessionStore.getSessionState(message.session_id));
-  for (const { header, payload } of sessionStore.getPointPayloads(message.session_id)) {
-    sendChunkUpdate(ws, header, payload);
+  for (const { header, payload, pose } of sessionStore.getPointPayloads(message.session_id)) {
+    sendChunkUpdate(ws, header, payload, pose);
   }
 }
 
@@ -290,19 +335,24 @@ function detachViewer(ws: WebSocket, sessionId?: string): void {
   }
 }
 
-function broadcastChunkUpdate(header: PointBatchHeaderMessage, payload: Buffer): void {
+function broadcastChunkUpdate(header: PointBatchHeaderMessage, payload: Buffer, pose: Pose): void {
   const viewers = viewerSockets.get(header.session_id);
   if (!viewers) {
     return;
   }
   for (const viewer of viewers) {
     if (viewer.readyState === viewer.OPEN) {
-      sendChunkUpdate(viewer, header, payload);
+      sendChunkUpdate(viewer, header, payload, pose);
     }
   }
 }
 
-function sendChunkUpdate(ws: WebSocket, header: PointBatchHeaderMessage, payload: Buffer): void {
+function sendChunkUpdate(
+  ws: WebSocket,
+  header: PointBatchHeaderMessage,
+  payload: Buffer,
+  pose: Pose,
+): void {
   const message: ChunkUpdateMessage = {
     type: 'chunk_update',
     session_id: header.session_id,
@@ -312,6 +362,7 @@ function sendChunkUpdate(ws: WebSocket, header: PointBatchHeaderMessage, payload
     point_format: header.point_format,
     stride_bytes: header.stride_bytes,
     timestamp: header.timestamp,
+    pose,
   };
   send(ws, message);
   ws.send(payload, { binary: true });

@@ -12,6 +12,11 @@ export interface SessionMetadata {
   room_id?: string;
 }
 
+export interface Pose {
+  translation_m: [number, number, number];
+  rotation_xyzw: [number, number, number, number];
+}
+
 export interface CreateSessionMessage {
   type: 'create_session';
   protocol_version: number;
@@ -37,10 +42,7 @@ export interface PoseUpdateMessage {
   publisher_id: string;
   sequence: number;
   timestamp: string;
-  pose: {
-    translation_m: [number, number, number];
-    rotation_xyzw: [number, number, number, number];
-  };
+  pose: Pose;
 }
 
 export interface PointBatchHeaderMessage {
@@ -124,6 +126,10 @@ export interface ChunkUpdateMessage {
   point_format: string;
   stride_bytes: number;
   timestamp: string;
+  // World transform for this batch's local-frame points. Viewers apply this to
+  // place points in the session world frame (the disk chunk store applies the
+  // same transform on the persistence path).
+  pose: Pose;
 }
 
 export type ServerMessage =

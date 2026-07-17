@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>point-cloud-visualizer</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; background: #0b0e13; color: #cdd6e4;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      #app { position: fixed; inset: 0; }
+      canvas { display: block; }
+      #hud { position: fixed; top: 12px; left: 12px; padding: 10px 12px;
+        background: rgba(14,18,26,0.78); border: 1px solid #223; border-radius: 8px;
+        backdrop-filter: blur(6px); min-width: 220px; }
+      #hud h1 { margin: 0 0 6px; font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+        color: #8fb7ff; text-transform: uppercase; }
+      #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+      #hud .k { color: #6b7891; }
+      #hud .v { color: #e6edf7; font-variant-numeric: tabular-nums; }
+      #hud .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+        background: #d4564b; margin-right: 6px; vertical-align: middle; }
+      #hud .dot.on { background: #57c77a; }
+      #controls { position: fixed; bottom: 12px; left: 12px; padding: 8px 12px;
+        background: rgba(14,18,26,0.78); border: 1px solid #223; border-radius: 8px; }
+      #controls input { background: #0b0e13; border: 1px solid #2a3550; color: #cdd6e4;
+        border-radius: 5px; padding: 4px 6px; font: inherit; width: 200px; }
+      #controls button { background: #1b2740; border: 1px solid #2a3550; color: #cdd6e4;
+        border-radius: 5px; padding: 4px 10px; font: inherit; cursor: pointer; }
+      #controls button:hover { background: #24345a; }
+      #controls label { color: #6b7891; margin-right: 6px; }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "./vendor/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <h1>point-cloud-visualizer</h1>
+      <div class="row"><span class="k"><span id="dot" class="dot"></span>status</span><span class="v" id="status">connecting</span></div>
+      <div class="row"><span class="k">session</span><span class="v" id="s-session">—</span></div>
+      <div class="row"><span class="k">points</span><span class="v" id="s-points">0</span></div>
+      <div class="row"><span class="k">batches</span><span class="v" id="s-batches">0</span></div>
+      <div class="row"><span class="k">rate</span><span class="v" id="s-rate">0 pts/s</span></div>
+      <div class="row"><span class="k">seq</span><span class="v" id="s-seq">—</span></div>
+    </div>
+    <div id="controls">
+      <label for="session">session_id</label>
+      <input id="session" placeholder="session id" />
+      <button id="connect">connect</button>
+      <button id="recenter">recenter</button>
+    </div>
+    <script type="module" src="./viewer.js"></script>
+  </body>
+</html>

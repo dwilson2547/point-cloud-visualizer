@@ -3,6 +3,7 @@ import {
   POINT_STRIDE_BYTES,
   type CreateSessionMessage,
   type PointBatchHeaderMessage,
+  type Pose,
   type PoseUpdateMessage,
   type ResumeSessionMessage,
   type SessionMetadata,
@@ -26,6 +27,7 @@ export interface SessionRecord {
   pointPayloads: Array<{
     header: PointBatchHeaderMessage;
     payload: Buffer;
+    pose: Pose;
   }>;
 }
 
@@ -133,7 +135,7 @@ export class SessionStore {
       throw new Error(`Unknown pose_sequence ${header.pose_sequence}`);
     }
 
-    session.pointPayloads.push({ header, payload });
+    session.pointPayloads.push({ header, payload, pose: pose.pose });
     if (session.pointPayloads.length > this.recentBatchLimit) {
       session.pointPayloads.shift();
     }
@@ -157,7 +159,9 @@ export class SessionStore {
     };
   }
 
-  getPointPayloads(sessionId: string): Array<{ header: PointBatchHeaderMessage; payload: Buffer }> {
+  getPointPayloads(
+    sessionId: string,
+  ): Array<{ header: PointBatchHeaderMessage; payload: Buffer; pose: Pose }> {
     return this.requireSession(sessionId).pointPayloads;
   }
 
