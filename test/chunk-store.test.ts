@@ -151,3 +151,91 @@ test('reads back world-frame points for a session from both dirty and flushed st
   assert.equal(countPoints(flushedRead), 2);
   assert.equal(flushedRead[0].readFloatLE(0), 1.25);
 });
+
+test('fuses repeated observations of a voxel into one mean representative and bounds density', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-fuse-'));
+  const sessionStore = new SessionStore();
+  // 4 cm voxels, high flush threshold so the batch stays resident (read from memory),
+  // then we flush and re-read to prove the disk round-trip fuses identically.
+  const chunkStore = new ChunkStore({
+    rootDir,
+    chunkSizeMeters: 1,
+    fuseVoxelMeters: 0.04,
+    flushPointThreshold: 100_000,
+    maxDirtyChunks: 8,
+  });
+
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'session-fuse',
+    publisher_id: 'publisher-fuse',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+  sessionStore.applyPoseUpdate({
+    type: 'pose_update',
+    session_id: 'session-fuse',
+    publisher_id: 'publisher-fuse',
+    sequence: 1,
+    timestamp: '2026-07-10T00:00:01Z',
+    pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+  });
+
+  // Three local points: A and B share a voxel (0.100 and 0.105 both floor to 0.04*2),
+  // C lands in its own voxel. Identity pose, so local == world.
+  const points: Array<[number, number, number]> = [
+    [0.1, 0.1, 0.1],
+    [0.105, 0.1, 0.1],
+    [0.5, 0.5, 0.5],
+  ];
+  const payload = Buffer.alloc(POINT_STRIDE_BYTES * points.length);
+  points.forEach(([x, y, z], i) => {
+    payload.writeFloatLE(x, i * POINT_STRIDE_BYTES);
+    payload.writeFloatLE(y, i * POINT_STRIDE_BYTES + 4);
+    payload.writeFloatLE(z, i * POINT_STRIDE_BYTES + 8);
+  });
+
+  const countPoints = (buffers: Buffer[]): number =>
+    buffers.reduce((total, buffer) => total + buffer.byteLength / POINT_STRIDE_BYTES, 0);
+
+  // Observe the identical batch five times: density must stay at 2 occupied voxels,
+  // not 15 raw points.
+  for (let seq = 0; seq < 5; seq++) {
+    const accepted = sessionStore.acceptPointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: 'session-fuse',
+        publisher_id: 'publisher-fuse',
+        sequence: 2 + seq,
+        timestamp: '2026-07-10T00:00:02Z',
+        pose_sequence: 1,
+        point_count: points.length,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    chunkStore.storeAcceptedBatch(accepted);
+  }
+
+  const residentRead = chunkStore.readSessionWorldChunks('session-fuse');
+  assert.equal(countPoints(residentRead), 2, 'repeated observations must not grow point count');
+  // A/B voxel representative is the mean of 0.100 and 0.105 across all repeats = 0.1025.
+  assert.ok(Math.abs(residentRead[0].readFloatLE(0) - 0.1025) < 1e-4);
+  assert.ok(Math.abs(residentRead[0].readFloatLE(POINT_STRIDE_BYTES) - 0.5) < 1e-4);
+
+  // The disk round-trip (flush -> re-seed on next touch is implied) fuses identically.
+  chunkStore.flushAll();
+  const flushedRead = chunkStore.readSessionWorldChunks('session-fuse');
+  assert.equal(countPoints(flushedRead), 2);
+  assert.ok(Math.abs(flushedRead[0].readFloatLE(0) - 0.1025) < 1e-4);
+
+  const [meta] = chunkStore.listSessionChunks('session-fuse');
+  assert.equal(meta.pointCount, 2);
+  assert.equal(meta.bytes, POINT_STRIDE_BYTES * 2);
+});

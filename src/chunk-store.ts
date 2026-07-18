@@ -10,6 +10,7 @@ import { POINT_STRIDE_BYTES } from './protocol.js';
 export interface ChunkStoreOptions {
   rootDir: string;
   chunkSizeMeters?: number;
+  fuseVoxelMeters?: number;
   flushPointThreshold?: number;
   maxDirtyChunks?: number;
 }
@@ -35,24 +36,46 @@ export interface ChunkMetadata {
 
 export interface StorageSummary {
   chunkSizeMeters: number;
+  fuseVoxelMeters: number;
   flushPointThreshold: number;
   maxDirtyChunks: number;
-  dirtyChunks: number;
+  activeChunks: number;
   persistedSessions: number;
   persistedChunks: number;
   persistedBytes: number;
 }
 
-interface DirtyChunk {
+// One occupied voxel's running fusion state: component sums plus a count, so the
+// representative point is the mean. Sums are commutative/associative, making fusion
+// order-independent and robust to out-of-order batches and revisits.
+interface VoxelAccumulator {
+  sx: number;
+  sy: number;
+  sz: number;
+  sr: number;
+  sg: number;
+  sb: number;
+  si: number;
+  n: number;
+}
+
+// A chunk resident in memory: its full current voxel set (seeded from disk on
+// activation, so it is a superset of the on-disk file). Stays resident across
+// periodic flushes and is released (persisted + dropped) only on eviction or an
+// explicit flush.
+interface ActiveChunk {
   sessionId: string;
   chunkKey: string;
   chunkX: number;
   chunkY: number;
   chunkZ: number;
   filePath: string;
-  buffers: Buffer[];
-  pointCount: number;
-  bytes: number;
+  voxels: Map<string, VoxelAccumulator>;
+  pointsSinceFlush: number;
+}
+
+interface SerializedVoxels {
+  buffer: Buffer;
   minX: number;
   minY: number;
   minZ: number;
@@ -78,18 +101,22 @@ interface SessionSnapshot {
 
 export class ChunkStore {
   readonly chunkSizeMeters: number;
+  readonly fuseVoxelMeters: number;
   readonly flushPointThreshold: number;
   readonly maxDirtyChunks: number;
 
   private readonly rootDir: string;
   private readonly chunksDir: string;
   private readonly database: DatabaseSync;
-  private readonly dirtyChunks = new Map<string, DirtyChunk>();
+  // Chunks currently resident in memory, keyed `sessionId:chunkKey`. Insertion
+  // order is the LRU order used for eviction.
+  private readonly activeChunks = new Map<string, ActiveChunk>();
 
   constructor(options: ChunkStoreOptions) {
     this.rootDir = options.rootDir;
     this.chunksDir = path.join(this.rootDir, 'chunks');
     this.chunkSizeMeters = options.chunkSizeMeters ?? 2;
+    this.fuseVoxelMeters = options.fuseVoxelMeters ?? 0.04;
     this.flushPointThreshold = options.flushPointThreshold ?? 50_000;
     this.maxDirtyChunks = options.maxDirtyChunks ?? 128;
 
@@ -134,11 +161,18 @@ export class ChunkStore {
       );
   }
 
+  // Transform a batch's local-frame points into the world frame and fuse them into
+  // per-chunk voxel grids. Density is bounded by occupied voxels, not by measurement
+  // count, so re-observing a surface adds no points once its voxels are filled.
   storeAcceptedBatch(accepted: AcceptedBatch): void {
-    const perChunk = new Map<string, DirtyChunk>();
     const payload = accepted.payload;
+    const sessionId = accepted.session.sessionId;
     const [tx, ty, tz] = accepted.pose.pose.translation_m;
     const [qx, qy, qz, qw] = accepted.pose.pose.rotation_xyzw;
+    const chunkSize = this.chunkSizeMeters;
+    const voxelSize = this.fuseVoxelMeters;
+
+    const touched = new Set<ActiveChunk>();
 
     for (let offset = 0; offset < payload.byteLength; offset += POINT_STRIDE_BYTES) {
       const localX = payload.readFloatLE(offset);
@@ -157,55 +191,65 @@ export class ChunkStore {
         tz,
       );
 
-      const chunkX = Math.floor(worldX / this.chunkSizeMeters);
-      const chunkY = Math.floor(worldY / this.chunkSizeMeters);
-      const chunkZ = Math.floor(worldZ / this.chunkSizeMeters);
-      const chunkKey = encodeChunkKey(chunkX, chunkY, chunkZ);
-      let dirtyChunk = perChunk.get(chunkKey);
-      if (!dirtyChunk) {
-        dirtyChunk = this.createDirtyChunk(accepted.session.sessionId, chunkKey, chunkX, chunkY, chunkZ);
-        perChunk.set(chunkKey, dirtyChunk);
+      const chunkX = Math.floor(worldX / chunkSize);
+      const chunkY = Math.floor(worldY / chunkSize);
+      const chunkZ = Math.floor(worldZ / chunkSize);
+      const active = this.activateChunk(sessionId, chunkX, chunkY, chunkZ);
+
+      const key = voxelKey(worldX, worldY, worldZ, voxelSize);
+      let acc = active.voxels.get(key);
+      if (!acc) {
+        acc = { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0 };
+        active.voxels.set(key, acc);
       }
+      acc.sx += worldX;
+      acc.sy += worldY;
+      acc.sz += worldZ;
+      acc.sr += payload[offset + 12];
+      acc.sg += payload[offset + 13];
+      acc.sb += payload[offset + 14];
+      acc.si += payload.readUInt16LE(offset + 15);
+      acc.n += 1;
 
-      const point = Buffer.allocUnsafe(POINT_STRIDE_BYTES);
-      point.writeFloatLE(worldX, 0);
-      point.writeFloatLE(worldY, 4);
-      point.writeFloatLE(worldZ, 8);
-      point[12] = payload[offset + 12];
-      point[13] = payload[offset + 13];
-      point[14] = payload[offset + 14];
-      point.writeUInt16LE(payload.readUInt16LE(offset + 15), 15);
-      point[17] = 0;
-
-      dirtyChunk.buffers.push(point);
-      dirtyChunk.pointCount += 1;
-      dirtyChunk.bytes += POINT_STRIDE_BYTES;
-      dirtyChunk.minX = Math.min(dirtyChunk.minX, worldX);
-      dirtyChunk.minY = Math.min(dirtyChunk.minY, worldY);
-      dirtyChunk.minZ = Math.min(dirtyChunk.minZ, worldZ);
-      dirtyChunk.maxX = Math.max(dirtyChunk.maxX, worldX);
-      dirtyChunk.maxY = Math.max(dirtyChunk.maxY, worldY);
-      dirtyChunk.maxZ = Math.max(dirtyChunk.maxZ, worldZ);
+      active.pointsSinceFlush += 1;
+      touched.add(active);
     }
 
-    for (const dirtyChunk of perChunk.values()) {
-      this.enqueueDirtyChunk(dirtyChunk);
+    // Refresh LRU order for touched chunks and persist any that crossed the flush
+    // cadence (kept resident afterwards so fusion continues in place).
+    for (const active of touched) {
+      const dirtyKey = `${active.sessionId}:${active.chunkKey}`;
+      this.activeChunks.delete(dirtyKey);
+      this.activeChunks.set(dirtyKey, active);
+      if (active.pointsSinceFlush >= this.flushPointThreshold) {
+        this.persistChunk(active);
+      }
+    }
+
+    // Bound resident memory: evict least-recently-used chunks (persist + drop).
+    while (this.activeChunks.size > this.maxDirtyChunks) {
+      const oldestKey = this.activeChunks.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      this.evictChunk(oldestKey);
     }
 
     this.syncSession(accepted.session);
   }
 
   flushSession(sessionId: string): void {
-    for (const key of [...this.dirtyChunks.keys()]) {
-      if (key.startsWith(`${sessionId}:`)) {
-        this.flushDirtyChunk(key);
+    const prefix = `${sessionId}:`;
+    for (const key of [...this.activeChunks.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.evictChunk(key);
       }
     }
   }
 
   flushAll(): void {
-    for (const key of [...this.dirtyChunks.keys()]) {
-      this.flushDirtyChunk(key);
+    for (const key of [...this.activeChunks.keys()]) {
+      this.evictChunk(key);
     }
   }
 
@@ -225,9 +269,10 @@ export class ChunkStore {
 
     return {
       chunkSizeMeters: this.chunkSizeMeters,
+      fuseVoxelMeters: this.fuseVoxelMeters,
       flushPointThreshold: this.flushPointThreshold,
       maxDirtyChunks: this.maxDirtyChunks,
-      dirtyChunks: this.dirtyChunks.size,
+      activeChunks: this.activeChunks.size,
       persistedSessions: counts.persisted_sessions,
       persistedChunks: counts.persisted_chunks,
       persistedBytes: counts.persisted_bytes,
@@ -266,14 +311,28 @@ export class ChunkStore {
       }));
   }
 
-  // Every persisted world-frame point for a session: flushed chunk files plus any
-  // not-yet-flushed dirty buffers (the two are disjoint — a flush deletes the dirty
-  // entry). Points are already world-frame, so no pose transform is needed. Returns
-  // one buffer per source chunk (empties skipped) so callers can stream the bootstrap
-  // incrementally instead of concatenating one huge blob.
+  // Every fused world-frame point for a session, one buffer per source chunk (empties
+  // skipped) so callers can stream the bootstrap incrementally. Resident chunks are
+  // emitted from their in-memory voxel set — which already folds in whatever was on
+  // disk — and only non-resident chunks are read from their files, so no voxel is
+  // counted twice. Points are already world-frame; no pose transform is needed.
   readSessionWorldChunks(sessionId: string): Buffer[] {
     const chunks: Buffer[] = [];
+    const emitted = new Set<string>();
+    const prefix = `${sessionId}:`;
+
+    for (const [key, active] of this.activeChunks) {
+      if (!key.startsWith(prefix) || active.voxels.size === 0) {
+        continue;
+      }
+      chunks.push(this.serializeVoxels(active.voxels).buffer);
+      emitted.add(active.chunkKey);
+    }
+
     for (const chunk of this.listSessionChunks(sessionId)) {
+      if (emitted.has(chunk.chunkKey)) {
+        continue;
+      }
       try {
         const data = fs.readFileSync(path.join(this.rootDir, chunk.filePath));
         if (data.byteLength > 0) {
@@ -283,12 +342,7 @@ export class ChunkStore {
         // Metadata can briefly lead the file on disk; skip an unreadable chunk.
       }
     }
-    const prefix = `${sessionId}:`;
-    for (const [key, dirty] of this.dirtyChunks) {
-      if (key.startsWith(prefix) && dirty.buffers.length > 0) {
-        chunks.push(Buffer.concat(dirty.buffers));
-      }
-    }
+
     return chunks;
   }
 
@@ -331,163 +385,177 @@ export class ChunkStore {
     `);
   }
 
-  private createDirtyChunk(
+  // Return the resident chunk for a cell, creating it (and seeding it from any
+  // existing file so fusion continues from prior state) on first touch.
+  private activateChunk(
     sessionId: string,
-    chunkKey: string,
     chunkX: number,
     chunkY: number,
     chunkZ: number,
-  ): DirtyChunk {
-    return {
+  ): ActiveChunk {
+    const chunkKey = encodeChunkKey(chunkX, chunkY, chunkZ);
+    const dirtyKey = `${sessionId}:${chunkKey}`;
+    const existing = this.activeChunks.get(dirtyKey);
+    if (existing) {
+      return existing;
+    }
+
+    const active: ActiveChunk = {
       sessionId,
       chunkKey,
       chunkX,
       chunkY,
       chunkZ,
       filePath: path.join(this.chunksDir, sessionId, `${chunkKey}.bin`),
-      buffers: [],
-      pointCount: 0,
-      bytes: 0,
-      minX: Number.POSITIVE_INFINITY,
-      minY: Number.POSITIVE_INFINITY,
-      minZ: Number.POSITIVE_INFINITY,
-      maxX: Number.NEGATIVE_INFINITY,
-      maxY: Number.NEGATIVE_INFINITY,
-      maxZ: Number.NEGATIVE_INFINITY,
+      voxels: new Map(),
+      pointsSinceFlush: 0,
     };
+    this.seedFromDisk(active);
+    this.activeChunks.set(dirtyKey, active);
+    return active;
   }
 
-  private enqueueDirtyChunk(incoming: DirtyChunk): void {
-    const dirtyKey = `${incoming.sessionId}:${incoming.chunkKey}`;
-    const existing = this.dirtyChunks.get(dirtyKey);
-    if (existing) {
-      existing.buffers.push(...incoming.buffers);
-      existing.pointCount += incoming.pointCount;
-      existing.bytes += incoming.bytes;
-      existing.minX = Math.min(existing.minX, incoming.minX);
-      existing.minY = Math.min(existing.minY, incoming.minY);
-      existing.minZ = Math.min(existing.minZ, incoming.minZ);
-      existing.maxX = Math.max(existing.maxX, incoming.maxX);
-      existing.maxY = Math.max(existing.maxY, incoming.maxY);
-      existing.maxZ = Math.max(existing.maxZ, incoming.maxZ);
-      this.dirtyChunks.delete(dirtyKey);
-      this.dirtyChunks.set(dirtyKey, existing);
-      if (existing.pointCount >= this.flushPointThreshold) {
-        this.flushDirtyChunk(dirtyKey);
-      }
-      return;
+  // Load a previously-flushed chunk file back into voxel accumulators. The file is
+  // already one representative per voxel, so each seeds a fresh accumulator at n=1.
+  private seedFromDisk(active: ActiveChunk): void {
+    let data: Buffer;
+    try {
+      data = fs.readFileSync(active.filePath);
+    } catch {
+      return; // resting chunk with no file yet, or unreadable — start empty
     }
-
-    this.dirtyChunks.set(dirtyKey, incoming);
-    if (incoming.pointCount >= this.flushPointThreshold) {
-      this.flushDirtyChunk(dirtyKey);
-      return;
-    }
-
-    while (this.dirtyChunks.size > this.maxDirtyChunks) {
-      const oldestKey = this.dirtyChunks.keys().next().value;
-      if (!oldestKey) {
-        break;
-      }
-      this.flushDirtyChunk(oldestKey);
+    for (let o = 0; o + POINT_STRIDE_BYTES <= data.byteLength; o += POINT_STRIDE_BYTES) {
+      const worldX = data.readFloatLE(o);
+      const worldY = data.readFloatLE(o + 4);
+      const worldZ = data.readFloatLE(o + 8);
+      active.voxels.set(voxelKey(worldX, worldY, worldZ, this.fuseVoxelMeters), {
+        sx: worldX,
+        sy: worldY,
+        sz: worldZ,
+        sr: data[o + 12],
+        sg: data[o + 13],
+        sb: data[o + 14],
+        si: data.readUInt16LE(o + 15),
+        n: 1,
+      });
     }
   }
 
-  private flushDirtyChunk(dirtyKey: string): void {
-    const dirtyChunk = this.dirtyChunks.get(dirtyKey);
-    if (!dirtyChunk) {
+  // Overwrite a chunk's file with its current voxel representatives and upsert its
+  // metadata. The chunk stays resident so fusion continues in place.
+  private persistChunk(active: ActiveChunk): void {
+    active.pointsSinceFlush = 0;
+    if (active.voxels.size === 0) {
       return;
     }
 
-    fs.mkdirSync(path.dirname(dirtyChunk.filePath), { recursive: true });
-    const payload = Buffer.concat(dirtyChunk.buffers);
-    fs.appendFileSync(dirtyChunk.filePath, payload);
+    const serialized = this.serializeVoxels(active.voxels);
+    fs.mkdirSync(path.dirname(active.filePath), { recursive: true });
+    fs.writeFileSync(active.filePath, serialized.buffer);
 
     const now = new Date().toISOString();
-    const existing = this.database
+    this.database
       .prepare(
-        `SELECT point_count, batch_count, bytes, min_x, min_y, min_z, max_x, max_y, max_z
-        FROM chunks WHERE session_id = ? AND chunk_key = ?`,
+        `INSERT INTO chunks (
+          session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
+          point_count, batch_count, bytes,
+          min_x, min_y, min_z, max_x, max_y, max_z, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, chunk_key) DO UPDATE SET
+          file_path = excluded.file_path,
+          point_count = excluded.point_count,
+          batch_count = chunks.batch_count + 1,
+          bytes = excluded.bytes,
+          min_x = excluded.min_x,
+          min_y = excluded.min_y,
+          min_z = excluded.min_z,
+          max_x = excluded.max_x,
+          max_y = excluded.max_y,
+          max_z = excluded.max_z,
+          updated_at = excluded.updated_at`,
       )
-      .get(dirtyChunk.sessionId, dirtyChunk.chunkKey) as
-      | {
-          point_count: number;
-          batch_count: number;
-          bytes: number;
-          min_x: number;
-          min_y: number;
-          min_z: number;
-          max_x: number;
-          max_y: number;
-          max_z: number;
-        }
-      | undefined;
+      .run(
+        active.sessionId,
+        active.chunkKey,
+        active.chunkX,
+        active.chunkY,
+        active.chunkZ,
+        path.relative(this.rootDir, active.filePath),
+        active.voxels.size,
+        1,
+        serialized.buffer.byteLength,
+        serialized.minX,
+        serialized.minY,
+        serialized.minZ,
+        serialized.maxX,
+        serialized.maxY,
+        serialized.maxZ,
+        now,
+      );
+  }
 
-    if (existing) {
-      this.database
-        .prepare(
-          `UPDATE chunks SET
-            point_count = ?,
-            batch_count = ?,
-            bytes = ?,
-            min_x = ?,
-            min_y = ?,
-            min_z = ?,
-            max_x = ?,
-            max_y = ?,
-            max_z = ?,
-            updated_at = ?
-          WHERE session_id = ? AND chunk_key = ?`,
-        )
-        .run(
-          existing.point_count + dirtyChunk.pointCount,
-          existing.batch_count + 1,
-          existing.bytes + dirtyChunk.bytes,
-          Math.min(existing.min_x, dirtyChunk.minX),
-          Math.min(existing.min_y, dirtyChunk.minY),
-          Math.min(existing.min_z, dirtyChunk.minZ),
-          Math.max(existing.max_x, dirtyChunk.maxX),
-          Math.max(existing.max_y, dirtyChunk.maxY),
-          Math.max(existing.max_z, dirtyChunk.maxZ),
-          now,
-          dirtyChunk.sessionId,
-          dirtyChunk.chunkKey,
-        );
-    } else {
-      this.database
-        .prepare(
-          `INSERT INTO chunks (
-            session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
-            point_count, batch_count, bytes,
-            min_x, min_y, min_z, max_x, max_y, max_z, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          dirtyChunk.sessionId,
-          dirtyChunk.chunkKey,
-          dirtyChunk.chunkX,
-          dirtyChunk.chunkY,
-          dirtyChunk.chunkZ,
-          path.relative(this.rootDir, dirtyChunk.filePath),
-          dirtyChunk.pointCount,
-          1,
-          dirtyChunk.bytes,
-          dirtyChunk.minX,
-          dirtyChunk.minY,
-          dirtyChunk.minZ,
-          dirtyChunk.maxX,
-          dirtyChunk.maxY,
-          dirtyChunk.maxZ,
-          now,
-        );
+  private evictChunk(dirtyKey: string): void {
+    const active = this.activeChunks.get(dirtyKey);
+    if (!active) {
+      return;
+    }
+    this.persistChunk(active);
+    this.activeChunks.delete(dirtyKey);
+  }
+
+  // Encode a voxel set to the on-disk / wire 18-byte point format (one representative
+  // per voxel, the component mean) and compute its world-frame bounds in one pass.
+  private serializeVoxels(voxels: Map<string, VoxelAccumulator>): SerializedVoxels {
+    const buffer = Buffer.allocUnsafe(voxels.size * POINT_STRIDE_BYTES);
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let minZ = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    let maxZ = Number.NEGATIVE_INFINITY;
+
+    let offset = 0;
+    for (const acc of voxels.values()) {
+      const x = acc.sx / acc.n;
+      const y = acc.sy / acc.n;
+      const z = acc.sz / acc.n;
+      buffer.writeFloatLE(x, offset);
+      buffer.writeFloatLE(y, offset + 4);
+      buffer.writeFloatLE(z, offset + 8);
+      buffer[offset + 12] = clampU8(Math.round(acc.sr / acc.n));
+      buffer[offset + 13] = clampU8(Math.round(acc.sg / acc.n));
+      buffer[offset + 14] = clampU8(Math.round(acc.sb / acc.n));
+      buffer.writeUInt16LE(clampU16(Math.round(acc.si / acc.n)), offset + 15);
+      buffer[offset + 17] = 0;
+
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      if (z > maxZ) maxZ = z;
+
+      offset += POINT_STRIDE_BYTES;
     }
 
-    this.dirtyChunks.delete(dirtyKey);
+    return { buffer, minX, minY, minZ, maxX, maxY, maxZ };
   }
 }
 
 function encodeChunkKey(chunkX: number, chunkY: number, chunkZ: number): string {
   return `${chunkX}_${chunkY}_${chunkZ}`;
+}
+
+function voxelKey(x: number, y: number, z: number, size: number): string {
+  return `${Math.floor(x / size)}_${Math.floor(y / size)}_${Math.floor(z / size)}`;
+}
+
+function clampU8(value: number): number {
+  return value < 0 ? 0 : value > 255 ? 255 : value;
+}
+
+function clampU16(value: number): number {
+  return value < 0 ? 0 : value > 65535 ? 65535 : value;
 }
 
 function rotateAndTranslate(
