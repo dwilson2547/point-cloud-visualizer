@@ -32,9 +32,7 @@ interface ConnectionState {
 }
 
 const port = parseIntegerEnv(process.env.PORT, 8080);
-const sessionStore = new SessionStore({
-  recentBatchLimit: parseIntegerEnv(process.env.RECENT_BATCH_LIMIT, 16),
-});
+const sessionStore = new SessionStore();
 const chunkStore = new ChunkStore({
   rootDir: path.resolve(process.env.DATA_DIR ?? 'data'),
   chunkSizeMeters: parseFloatEnv(process.env.CHUNK_SIZE_METERS, 2),

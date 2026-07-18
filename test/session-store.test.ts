@@ -55,13 +55,6 @@ test('creates a session, accepts pose updates, and accepts a point batch', () =>
   assert.equal(state.point_batches, 1);
   assert.equal(state.last_sequence, 2);
   assert.equal(state.last_pose_sequence, 1);
-
-  // The viewer replay path must carry the resolved pose so viewers can place
-  // the batch's local-frame points into the session world frame.
-  const replay = store.getPointPayloads('session-a');
-  assert.equal(replay.length, 1);
-  assert.deepEqual(replay[0].pose.translation_m, [1, 2, 3]);
-  assert.deepEqual(replay[0].pose.rotation_xyzw, [0, 0, 0, 1]);
 });
 
 test('rejects out-of-order sequence numbers', () => {

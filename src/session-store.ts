@@ -3,7 +3,6 @@ import {
   POINT_STRIDE_BYTES,
   type CreateSessionMessage,
   type PointBatchHeaderMessage,
-  type Pose,
   type PoseUpdateMessage,
   type ResumeSessionMessage,
   type SessionMetadata,
@@ -24,11 +23,6 @@ export interface SessionRecord {
   totalPoints: number;
   pointBatches: number;
   poses: Map<number, PoseUpdateMessage>;
-  pointPayloads: Array<{
-    header: PointBatchHeaderMessage;
-    payload: Buffer;
-    pose: Pose;
-  }>;
 }
 
 export interface AcceptedBatch {
@@ -40,11 +34,6 @@ export interface AcceptedBatch {
 
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
-  private readonly recentBatchLimit: number;
-
-  constructor(options?: { recentBatchLimit?: number }) {
-    this.recentBatchLimit = options?.recentBatchLimit ?? 16;
-  }
 
   createSession(message: CreateSessionMessage): SessionRecord {
     if (message.protocol_version !== 1) {
@@ -72,7 +61,6 @@ export class SessionStore {
       totalPoints: 0,
       pointBatches: 0,
       poses: new Map(),
-      pointPayloads: [],
     };
 
     this.sessions.set(session.sessionId, session);
@@ -135,10 +123,6 @@ export class SessionStore {
       throw new Error(`Unknown pose_sequence ${header.pose_sequence}`);
     }
 
-    session.pointPayloads.push({ header, payload, pose: pose.pose });
-    if (session.pointPayloads.length > this.recentBatchLimit) {
-      session.pointPayloads.shift();
-    }
     session.pointBatches += 1;
     session.totalPoints += header.point_count;
     session.lastSequence = header.sequence;
@@ -157,12 +141,6 @@ export class SessionStore {
       last_sequence: session.lastSequence,
       last_pose_sequence: session.lastPoseSequence,
     };
-  }
-
-  getPointPayloads(
-    sessionId: string,
-  ): Array<{ header: PointBatchHeaderMessage; payload: Buffer; pose: Pose }> {
-    return this.requireSession(sessionId).pointPayloads;
   }
 
   getSessionCount(): number {
