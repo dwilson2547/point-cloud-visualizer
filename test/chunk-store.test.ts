@@ -340,3 +340,76 @@ test('derives coarser LOD levels by mean-binning the fine grid (resident and on 
   // Unknown chunk yields an empty buffer, not a throw.
   assert.equal(chunkStore.deriveChunkLevel('session-lod', '9_9_9', 0).byteLength, 0);
 });
+
+test('listSessionChunkKeys unions resident and persisted cells', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-keys-'));
+  const sessionStore = new SessionStore();
+  const chunkStore = new ChunkStore({
+    rootDir,
+    chunkSizeMeters: 1,
+    flushPointThreshold: 100_000, // keep chunks resident until we explicitly flush
+    maxDirtyChunks: 8,
+  });
+
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'session-keys',
+    publisher_id: 'publisher-keys',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+
+  let sequence = 0;
+  const storePoint = (x: number, y: number, z: number): void => {
+    sessionStore.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: 'session-keys',
+      publisher_id: 'publisher-keys',
+      sequence: ++sequence,
+      timestamp: '2026-07-10T00:00:01Z',
+      pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    const payload = Buffer.alloc(POINT_STRIDE_BYTES);
+    payload.writeFloatLE(x, 0);
+    payload.writeFloatLE(y, 4);
+    payload.writeFloatLE(z, 8);
+    chunkStore.storeAcceptedBatch(
+      sessionStore.acceptPointBatch(
+        {
+          type: 'point_batch_header',
+          session_id: 'session-keys',
+          publisher_id: 'publisher-keys',
+          sequence: ++sequence,
+          timestamp: '2026-07-10T00:00:02Z',
+          pose_sequence: sequence - 1,
+          point_count: 1,
+          point_format: POINT_FORMAT,
+          encoding: 'binary_le',
+          compression: 'none',
+          stride_bytes: POINT_STRIDE_BYTES,
+        },
+        payload,
+      ),
+    );
+  };
+
+  // Two resident cells, nothing flushed yet.
+  storePoint(0.5, 0.5, 0.5); // cell 0_0_0
+  storePoint(3.5, 0.5, 0.5); // cell 3_0_0
+  assert.equal(chunkStore.listSessionChunks('session-keys').length, 0, 'nothing persisted yet');
+  assert.deepEqual(
+    chunkStore.listSessionChunkKeys('session-keys').map((c) => c.chunkKey).sort(),
+    ['0_0_0', '3_0_0'],
+  );
+
+  // Flush (both persisted) then add a third resident cell: union covers all three.
+  chunkStore.flushAll();
+  storePoint(6.5, 0.5, 0.5); // cell 6_0_0
+  assert.deepEqual(
+    chunkStore.listSessionChunkKeys('session-keys').map((c) => c.chunkKey).sort(),
+    ['0_0_0', '3_0_0', '6_0_0'],
+  );
+});

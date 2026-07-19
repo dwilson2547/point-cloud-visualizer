@@ -351,6 +351,38 @@ export class ChunkStore {
     return chunks;
   }
 
+  // All chunk cells for a session (resident + persisted, deduped). Chunk metadata only
+  // covers flushed chunks, so resident-but-never-flushed cells are folded in from the
+  // in-memory set. Integer cell coords let a caller derive the cell AABB for culling/LOD
+  // without reading any point data.
+  listSessionChunkKeys(
+    sessionId: string,
+  ): Array<{ chunkKey: string; chunkX: number; chunkY: number; chunkZ: number }> {
+    const cells = new Map<string, { chunkKey: string; chunkX: number; chunkY: number; chunkZ: number }>();
+    const prefix = `${sessionId}:`;
+    for (const [key, active] of this.activeChunks) {
+      if (key.startsWith(prefix)) {
+        cells.set(active.chunkKey, {
+          chunkKey: active.chunkKey,
+          chunkX: active.chunkX,
+          chunkY: active.chunkY,
+          chunkZ: active.chunkZ,
+        });
+      }
+    }
+    for (const meta of this.listSessionChunks(sessionId)) {
+      if (!cells.has(meta.chunkKey)) {
+        cells.set(meta.chunkKey, {
+          chunkKey: meta.chunkKey,
+          chunkX: meta.chunkX,
+          chunkY: meta.chunkY,
+          chunkZ: meta.chunkZ,
+        });
+      }
+    }
+    return [...cells.values()];
+  }
+
   // Voxel edge length for an LOD level. Level 0 is coarsest; the finest level
   // (numLevels - 1) is the fused ingest grid (fuseVoxelMeters). Coarser levels double
   // the edge each step, so their cells nest exactly over the fine grid.

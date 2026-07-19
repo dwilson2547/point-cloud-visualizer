@@ -186,17 +186,19 @@ interface ChunkDropMessage {
 
 Each rung is independently reviewable and (for the server logic) unit-testable:
 
-- **2b-1 — LOD derivation (server, no protocol change).** `ChunkStore.deriveChunkLevel(sessionId,
-  chunkKey, level)`: mean-bin the fine voxels to a coarser grid (resident or from disk). Test:
-  coarser level has ≤ fine count, representatives are child-voxel means, bounds preserved, nesting
-  is exact. Pure and fully testable — the foundation.
-- **2b-2 — level ladder + selection math (server).** `numLevels`, per-chunk `selectLevel(aabb,
-  camera)` screen-space projection, frustum/range tests. Test: near→fine, far→coarse, monotonic.
-- **2b-3 — protocol + `viewer_view` plumbing.** Add the three messages; server keeps per-viewer
-  sent-state and emits `chunk_lod`/`chunk_drop` diffs; replace the eager full-bootstrap with
-  view-driven serving (send coarsest in-range as a default until the first `viewer_view` arrives).
+- **2b-1 — LOD derivation (server, no protocol change). Done.** `ChunkStore.deriveChunkLevel()`
+  mean-bins the fine voxels to a coarser grid (resident or from disk); level ladder + clamping.
+- **2b-2 — level ladder + selection math (server). Done.** `src/lod-select.ts`: `buildFrustum`,
+  `frustumContainsAabb`, `selectChunkLevel` (screen-space projection, near→fine/far→coarse,
+  frustum/range cull). Pure, unit-tested.
+- **2b-3 — protocol + `viewer_view` plumbing. Done.** Added `viewer_view` / `chunk_lod` /
+  `chunk_drop`. A viewer connecting with `?lod=1` enters LOD mode (no bootstrap); the server keeps
+  per-viewer sent-level state (`ChunkStore.listSessionChunkKeys` unions resident + persisted cells,
+  cull/level via the cell AABB) and emits `chunk_lod`/`chunk_drop` diffs on each `viewer_view`.
+  Plain viewers keep the full-bootstrap path. Live `chunk_update` still broadcasts to all viewers.
 - **2b-4 — viewer base layer.** Per-chunk GPU buffers keyed by `chunk_key`; handle `chunk_lod`
-  (replace) / `chunk_drop` (dispose); send `viewer_view` on camera settle. Live overlay unchanged.
+  (replace) / `chunk_drop` (dispose); connect with `?lod=1` and send `viewer_view` on camera settle.
+  Live overlay (the existing ring buffer) unchanged.
 - **2b-5 — live base refresh.** Periodic re-send of changed visible chunks at each viewer's level.
 
 ## Status / recommendation

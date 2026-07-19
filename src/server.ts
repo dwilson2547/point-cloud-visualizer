@@ -14,21 +14,35 @@ import {
   makeError,
   parseClientMessage,
   type ChunkBootstrapMessage,
+  type ChunkDropMessage,
+  type ChunkLodMessage,
   type ChunkUpdateMessage,
   type ConnectionRole,
   type PointBatchHeaderMessage,
   type Pose,
   type ServerMessage,
   type ViewerJoinMessage,
+  type ViewerViewMessage,
 } from './protocol.js';
 import { ChunkStore } from './chunk-store.js';
 import { SessionStore } from './session-store.js';
+import {
+  buildFrustum,
+  selectChunkLevel,
+  type Aabb,
+  type LodLadder,
+  type ViewCamera,
+} from './lod-select.js';
 
 interface ConnectionState {
   role: ConnectionRole;
   sessionId?: string;
   publisherId?: string;
   pendingBatchHeader?: PointBatchHeaderMessage;
+  // Viewer-only, LOD mode (connected with ?lod=1): the level currently sent for each
+  // chunk_key, so a view update can send just the diffs (changed levels + drops).
+  lodMode?: boolean;
+  sentLevels?: Map<string, number>;
 }
 
 const port = parseIntegerEnv(process.env.PORT, 8080);
@@ -162,8 +176,9 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   if (url.pathname === '/ws/view') {
+    const lodMode = url.searchParams.get('lod') === '1';
     viewerWss.handleUpgrade(req, socket, head, (ws) => {
-      configureViewerSocket(ws, url.searchParams.get('session_id') ?? undefined);
+      configureViewerSocket(ws, url.searchParams.get('session_id') ?? undefined, lodMode);
     });
     return;
   }
@@ -277,8 +292,8 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
   broadcastChunkUpdate(accepted.header, accepted.payload, accepted.pose.pose);
 }
 
-function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string): void {
-  const state: ConnectionState = { role: VIEWER_ROLE };
+function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMode = false): void {
+  const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sentLevels: new Map() };
 
   ws.on('message', (data, isBinary) => {
     try {
@@ -286,10 +301,15 @@ function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string): void
         throw new Error('Viewer endpoint does not accept binary client messages');
       }
       const message = parseClientMessage(data.toString());
-      if (message.type !== 'viewer_join') {
-        throw new Error('Viewer endpoint expects viewer_join');
+      if (message.type === 'viewer_join') {
+        attachViewer(ws, state, message);
+        return;
       }
-      attachViewer(ws, state, message);
+      if (message.type === 'viewer_view') {
+        onViewerView(ws, state, message);
+        return;
+      }
+      throw new Error('Viewer endpoint expects viewer_join or viewer_view');
     } catch (error) {
       send(ws, makeError('protocol_error', getErrorMessage(error), false, state.sessionId));
     }
@@ -317,8 +337,12 @@ function attachViewer(ws: WebSocket, state: ConnectionState, message: ViewerJoin
   viewers.add(ws);
 
   send(ws, sessionStore.getSessionState(message.session_id));
-  // Bootstrap the full accumulated world cloud from disk (flushed + dirty), then the
-  // viewer receives live chunk_update deltas from here on via broadcastChunkUpdate.
+  // LOD-mode viewers get their base layer from view-driven chunk_lod messages (once
+  // they send viewer_view) instead of the full cloud, so skip the bootstrap here. Plain
+  // viewers still get the whole accumulated world up front.
+  if (state.lodMode) {
+    return;
+  }
   for (const worldPoints of chunkStore.readSessionWorldChunks(message.session_id)) {
     sendChunkBootstrap(ws, message.session_id, worldPoints);
   }
@@ -381,6 +405,106 @@ function sendChunkBootstrap(ws: WebSocket, sessionId: string, worldPoints: Buffe
   };
   send(ws, message);
   ws.send(worldPoints, { binary: true });
+}
+
+// Recompute the LOD base layer for a viewer against its latest camera: for each chunk
+// cell, cull or pick a level, and send only the diffs — a chunk_lod when its level
+// changed (or it is newly visible) and a chunk_drop when it left the view.
+function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerViewMessage): void {
+  state.sessionId = message.session_id;
+  const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
+
+  const frustum = buildFrustum(toViewCamera(message));
+  const ladder: LodLadder = {
+    fuseVoxelMeters: chunkStore.fuseVoxelMeters,
+    numLevels: chunkStore.numLevels,
+  };
+  const size = chunkStore.chunkSizeMeters;
+
+  const visible = new Set<string>();
+  for (const cell of chunkStore.listSessionChunkKeys(message.session_id)) {
+    const aabb: Aabb = {
+      min: [cell.chunkX * size, cell.chunkY * size, cell.chunkZ * size],
+      max: [(cell.chunkX + 1) * size, (cell.chunkY + 1) * size, (cell.chunkZ + 1) * size],
+    };
+    const level = selectChunkLevel(aabb, frustum, ladder);
+    if (level === null) {
+      continue; // culled
+    }
+    visible.add(cell.chunkKey);
+    if (sentLevels.get(cell.chunkKey) === level) {
+      continue; // already at this level — no re-send
+    }
+    const worldPoints = chunkStore.deriveChunkLevel(message.session_id, cell.chunkKey, level);
+    if (worldPoints.byteLength === 0) {
+      continue;
+    }
+    sendChunkLod(ws, message.session_id, cell.chunkKey, level, worldPoints);
+    sentLevels.set(cell.chunkKey, level);
+  }
+
+  for (const chunkKey of [...sentLevels.keys()]) {
+    if (!visible.has(chunkKey)) {
+      sendChunkDrop(ws, message.session_id, chunkKey);
+      sentLevels.delete(chunkKey);
+    }
+  }
+}
+
+function toViewCamera(message: ViewerViewMessage): ViewCamera {
+  const isVec3 = (v: unknown): v is [number, number, number] =>
+    Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n));
+  if (!isVec3(message.position) || !isVec3(message.forward) || !isVec3(message.up)) {
+    throw new Error('viewer_view requires finite [x,y,z] position, forward, and up');
+  }
+  if (
+    !Array.isArray(message.viewport_px) ||
+    message.viewport_px.length !== 2 ||
+    !message.viewport_px.every((n) => Number.isFinite(n))
+  ) {
+    throw new Error('viewer_view requires a finite viewport_px [width, height]');
+  }
+  if (![message.fov_y_rad, message.near_m, message.far_m].every((n) => Number.isFinite(n))) {
+    throw new Error('viewer_view requires finite fov_y_rad, near_m, and far_m');
+  }
+  return {
+    position: message.position,
+    forward: message.forward,
+    up: message.up,
+    fovYRad: message.fov_y_rad,
+    viewportPx: message.viewport_px,
+    nearM: message.near_m,
+    farM: message.far_m,
+  };
+}
+
+function sendChunkLod(
+  ws: WebSocket,
+  sessionId: string,
+  chunkKey: string,
+  level: number,
+  worldPoints: Buffer,
+): void {
+  const message: ChunkLodMessage = {
+    type: 'chunk_lod',
+    session_id: sessionId,
+    chunk_key: chunkKey,
+    level,
+    point_count: worldPoints.byteLength / POINT_STRIDE_BYTES,
+    point_format: POINT_FORMAT,
+    stride_bytes: POINT_STRIDE_BYTES,
+  };
+  send(ws, message);
+  ws.send(worldPoints, { binary: true });
+}
+
+function sendChunkDrop(ws: WebSocket, sessionId: string, chunkKey: string): void {
+  const message: ChunkDropMessage = {
+    type: 'chunk_drop',
+    session_id: sessionId,
+    chunk_key: chunkKey,
+  };
+  send(ws, message);
 }
 
 function send(ws: WebSocket, message: ServerMessage): void {
