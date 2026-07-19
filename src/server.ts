@@ -37,6 +37,7 @@ const chunkStore = new ChunkStore({
   rootDir: path.resolve(process.env.DATA_DIR ?? 'data'),
   chunkSizeMeters: parseFloatEnv(process.env.CHUNK_SIZE_METERS, 2),
   fuseVoxelMeters: parseFloatEnv(process.env.FUSE_VOXEL_METERS, 0.04),
+  numLevels: parseIntegerEnv(process.env.LOD_LEVELS, 6),
   flushPointThreshold: parseIntegerEnv(process.env.FLUSH_POINT_THRESHOLD, 50_000),
   maxDirtyChunks: parseIntegerEnv(process.env.MAX_DIRTY_CHUNKS, 128),
 });

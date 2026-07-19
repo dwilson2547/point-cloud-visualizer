@@ -11,6 +11,7 @@ export interface ChunkStoreOptions {
   rootDir: string;
   chunkSizeMeters?: number;
   fuseVoxelMeters?: number;
+  numLevels?: number;
   flushPointThreshold?: number;
   maxDirtyChunks?: number;
 }
@@ -37,6 +38,7 @@ export interface ChunkMetadata {
 export interface StorageSummary {
   chunkSizeMeters: number;
   fuseVoxelMeters: number;
+  numLevels: number;
   flushPointThreshold: number;
   maxDirtyChunks: number;
   activeChunks: number;
@@ -102,6 +104,7 @@ interface SessionSnapshot {
 export class ChunkStore {
   readonly chunkSizeMeters: number;
   readonly fuseVoxelMeters: number;
+  readonly numLevels: number;
   readonly flushPointThreshold: number;
   readonly maxDirtyChunks: number;
 
@@ -117,6 +120,7 @@ export class ChunkStore {
     this.chunksDir = path.join(this.rootDir, 'chunks');
     this.chunkSizeMeters = options.chunkSizeMeters ?? 2;
     this.fuseVoxelMeters = options.fuseVoxelMeters ?? 0.04;
+    this.numLevels = Math.max(1, options.numLevels ?? 6);
     this.flushPointThreshold = options.flushPointThreshold ?? 50_000;
     this.maxDirtyChunks = options.maxDirtyChunks ?? 128;
 
@@ -270,6 +274,7 @@ export class ChunkStore {
     return {
       chunkSizeMeters: this.chunkSizeMeters,
       fuseVoxelMeters: this.fuseVoxelMeters,
+      numLevels: this.numLevels,
       flushPointThreshold: this.flushPointThreshold,
       maxDirtyChunks: this.maxDirtyChunks,
       activeChunks: this.activeChunks.size,
@@ -344,6 +349,45 @@ export class ChunkStore {
     }
 
     return chunks;
+  }
+
+  // Voxel edge length for an LOD level. Level 0 is coarsest; the finest level
+  // (numLevels - 1) is the fused ingest grid (fuseVoxelMeters). Coarser levels double
+  // the edge each step, so their cells nest exactly over the fine grid.
+  levelVoxelMeters(level: number): number {
+    const finest = this.numLevels - 1;
+    const clamped = level < 0 ? 0 : level > finest ? finest : level;
+    return this.fuseVoxelMeters * 2 ** (finest - clamped);
+  }
+
+  // Derive a chunk's points at an LOD level: the fine representatives re-binned to the
+  // level's coarser grid (each fine voxel counted once — spatially uniform). Returns
+  // the 18-byte world-frame point buffer ready to ship, or an empty buffer if the
+  // chunk has no data. Works whether the chunk is resident or resting on disk, since
+  // both resolve to the same fine representative buffer first.
+  deriveChunkLevel(sessionId: string, chunkKey: string, level: number): Buffer {
+    const fine = this.readFineRepresentatives(sessionId, chunkKey);
+    if (!fine || fine.byteLength === 0) {
+      return Buffer.alloc(0);
+    }
+    if (level >= this.numLevels - 1) {
+      return fine; // finest level is the fused grid itself — no coarsening needed
+    }
+    return this.serializeVoxels(binPoints(fine, this.levelVoxelMeters(level))).buffer;
+  }
+
+  // The chunk's fused fine representatives (one 18-byte point per occupied fine voxel):
+  // from the in-memory voxel set if resident, else from its on-disk file.
+  private readFineRepresentatives(sessionId: string, chunkKey: string): Buffer | null {
+    const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
+    if (active) {
+      return active.voxels.size > 0 ? this.serializeVoxels(active.voxels).buffer : null;
+    }
+    try {
+      return fs.readFileSync(path.join(this.chunksDir, sessionId, `${chunkKey}.bin`));
+    } catch {
+      return null;
+    }
   }
 
   private initializeSchema(): void {
@@ -548,6 +592,33 @@ function encodeChunkKey(chunkX: number, chunkY: number, chunkZ: number): string 
 
 function voxelKey(x: number, y: number, z: number, size: number): string {
   return `${Math.floor(x / size)}_${Math.floor(y / size)}_${Math.floor(z / size)}`;
+}
+
+// Accumulate 18-byte world-frame points into voxels of the given edge length, one
+// accumulator per occupied cell (each input point weighted equally). Used to coarsen
+// fine representatives into an LOD level.
+function binPoints(buffer: Buffer, size: number): Map<string, VoxelAccumulator> {
+  const voxels = new Map<string, VoxelAccumulator>();
+  for (let offset = 0; offset + POINT_STRIDE_BYTES <= buffer.byteLength; offset += POINT_STRIDE_BYTES) {
+    const x = buffer.readFloatLE(offset);
+    const y = buffer.readFloatLE(offset + 4);
+    const z = buffer.readFloatLE(offset + 8);
+    const key = voxelKey(x, y, z, size);
+    let acc = voxels.get(key);
+    if (!acc) {
+      acc = { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0 };
+      voxels.set(key, acc);
+    }
+    acc.sx += x;
+    acc.sy += y;
+    acc.sz += z;
+    acc.sr += buffer[offset + 12];
+    acc.sg += buffer[offset + 13];
+    acc.sb += buffer[offset + 14];
+    acc.si += buffer.readUInt16LE(offset + 15);
+    acc.n += 1;
+  }
+  return voxels;
 }
 
 function clampU8(value: number): number {

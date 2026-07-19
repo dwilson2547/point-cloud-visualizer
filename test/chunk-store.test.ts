@@ -239,3 +239,104 @@ test('fuses repeated observations of a voxel into one mean representative and bo
   assert.equal(meta.pointCount, 2);
   assert.equal(meta.bytes, POINT_STRIDE_BYTES * 2);
 });
+
+test('derives coarser LOD levels by mean-binning the fine grid (resident and on disk)', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-lod-'));
+  const sessionStore = new SessionStore();
+  // Finest voxel 0.5 m, 2 levels: level 1 = 0.5 m (fine grid), level 0 = 1.0 m (coarse).
+  const chunkStore = new ChunkStore({
+    rootDir,
+    chunkSizeMeters: 4,
+    fuseVoxelMeters: 0.5,
+    numLevels: 2,
+    flushPointThreshold: 100_000,
+    maxDirtyChunks: 8,
+  });
+  assert.equal(chunkStore.levelVoxelMeters(1), 0.5);
+  assert.equal(chunkStore.levelVoxelMeters(0), 1.0);
+  // Clamps out-of-range levels to the ends of the ladder.
+  assert.equal(chunkStore.levelVoxelMeters(5), 0.5);
+  assert.equal(chunkStore.levelVoxelMeters(-3), 1.0);
+
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'session-lod',
+    publisher_id: 'publisher-lod',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+  sessionStore.applyPoseUpdate({
+    type: 'pose_update',
+    session_id: 'session-lod',
+    publisher_id: 'publisher-lod',
+    sequence: 1,
+    timestamp: '2026-07-10T00:00:01Z',
+    pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+  });
+
+  // Three points, all in one 4 m chunk. Identity pose so local == world.
+  //   A(0.25) and B(0.75) sit in distinct 0.5 m voxels but share the 1.0 m voxel (0,0,0).
+  //   C(2.25) is alone in both grids.
+  const points: Array<[number, number, number]> = [
+    [0.25, 0.25, 0.25],
+    [0.75, 0.25, 0.25],
+    [2.25, 2.25, 2.25],
+  ];
+  const payload = Buffer.alloc(POINT_STRIDE_BYTES * points.length);
+  points.forEach(([x, y, z], i) => {
+    payload.writeFloatLE(x, i * POINT_STRIDE_BYTES);
+    payload.writeFloatLE(y, i * POINT_STRIDE_BYTES + 4);
+    payload.writeFloatLE(z, i * POINT_STRIDE_BYTES + 8);
+  });
+  chunkStore.storeAcceptedBatch(
+    sessionStore.acceptPointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: 'session-lod',
+        publisher_id: 'publisher-lod',
+        sequence: 2,
+        timestamp: '2026-07-10T00:00:02Z',
+        pose_sequence: 1,
+        point_count: points.length,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    ),
+  );
+
+  const chunkKey = '0_0_0';
+  const readXs = (buffer: Buffer): number[] => {
+    const xs: number[] = [];
+    for (let o = 0; o + POINT_STRIDE_BYTES <= buffer.byteLength; o += POINT_STRIDE_BYTES) {
+      xs.push(buffer.readFloatLE(o));
+    }
+    return xs;
+  };
+
+  // Finest level (1) is the fine grid unchanged: three representatives.
+  const fine = chunkStore.deriveChunkLevel('session-lod', chunkKey, 1);
+  assert.deepEqual(readXs(fine).sort((a, b) => a - b), [0.25, 0.75, 2.25]);
+  // A level past the finest clamps to the fine grid.
+  assert.equal(chunkStore.deriveChunkLevel('session-lod', chunkKey, 9).byteLength, fine.byteLength);
+
+  // Coarse level (0): A and B collapse into one 1.0 m voxel at their mean (0.5); C stays.
+  const coarseResident = chunkStore.deriveChunkLevel('session-lod', chunkKey, 0);
+  assert.equal(readXs(coarseResident).length, 2, 'coarse level must have fewer points');
+  assert.deepEqual(readXs(coarseResident).sort((a, b) => a - b), [0.5, 2.25]);
+  // The merged coarse representative stays within its children's bounds (nesting holds).
+  assert.ok(0.25 <= 0.5 && 0.5 <= 0.75);
+
+  // Same derivation once the chunk is resting on disk (read + coarsen path).
+  chunkStore.flushAll();
+  const coarseDisk = chunkStore.deriveChunkLevel('session-lod', chunkKey, 0);
+  assert.deepEqual(readXs(coarseDisk).sort((a, b) => a - b), [0.5, 2.25]);
+
+  // Unknown chunk yields an empty buffer, not a throw.
+  assert.equal(chunkStore.deriveChunkLevel('session-lod', '9_9_9', 0).byteLength, 0);
+});
