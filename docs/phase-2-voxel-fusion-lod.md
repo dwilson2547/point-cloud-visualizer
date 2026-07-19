@@ -201,14 +201,19 @@ Each rung is independently reviewable and (for the server logic) unit-testable:
   object) and the existing ring buffer as the live overlay (fed by `chunk_update`). Connects with
   `?lod=1` and emits `viewer_view` on camera settle (~5 Hz). Verified in-browser: 74 chunks /
   313k pts loaded from `chunk_lod` alone, and zooming culled to 53 chunks via `chunk_drop`.
-- **2b-5 — live base refresh.** Periodic re-send of changed visible chunks at each viewer's level.
+- **2b-5 — live base refresh. Done.** Ingest reports touched chunk keys; the server coalesces them
+  per session and, on a ~500 ms tick (`LIVE_REFRESH_MS`), re-sends each changed chunk to every LOD
+  viewer at its current-camera level (forced even when the level is unchanged, since the data grew),
+  picking up newly-visible changed chunks and dropping ones that left the view. Verified: under a
+  static camera the base grew 25.6k→75.6k pts (36→80 chunks) while the publisher streamed.
 
 ## Status / recommendation
 
 - **2a — done.** Voxel fusion landed; density bounded; serving path unchanged.
-- **2b — designed above.** Decisions made: **mip-per-chunk** (not additive octree) for
-  mutability + simplicity, and a **two-layer viewer** (LOD base + reused live-ring overlay). Build
-  the ladder 2b-1 → 2b-5; the first two rungs are pure server logic and make good standalone tasks.
+- **2b — done (2b-1 → 2b-5).** Mip-per-chunk LOD derived on demand from the fine grid; view-driven
+  serving (`viewer_view` → `chunk_lod`/`chunk_drop` diffs) with frustum/range culling; two-layer
+  viewer (per-chunk base + reused live-ring overlay); live base refresh so the accumulated cloud
+  grows without camera motion. Additive octree remains a deferred bandwidth optimization.
 
 ## Open questions
 

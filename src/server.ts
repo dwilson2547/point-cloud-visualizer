@@ -30,6 +30,7 @@ import {
   buildFrustum,
   selectChunkLevel,
   type Aabb,
+  type Frustum,
   type LodLadder,
   type ViewCamera,
 } from './lod-select.js';
@@ -40,10 +41,14 @@ interface ConnectionState {
   publisherId?: string;
   pendingBatchHeader?: PointBatchHeaderMessage;
   // Viewer-only, LOD mode (connected with ?lod=1): the level currently sent for each
-  // chunk_key, so a view update can send just the diffs (changed levels + drops).
+  // chunk_key (so a view update sends just the diffs) and the last frustum (so live
+  // refresh can re-evaluate a changed chunk against this viewer's current camera).
   lodMode?: boolean;
   sentLevels?: Map<string, number>;
+  frustum?: Frustum;
 }
+
+type ChunkCell = { chunkKey: string; chunkX: number; chunkY: number; chunkZ: number };
 
 const port = parseIntegerEnv(process.env.PORT, 8080);
 const sessionStore = new SessionStore();
@@ -56,6 +61,13 @@ const chunkStore = new ChunkStore({
   maxDirtyChunks: parseIntegerEnv(process.env.MAX_DIRTY_CHUNKS, 128),
 });
 const viewerSockets = new Map<string, Set<WebSocket>>();
+// Per-viewer connection state, so the live-refresh tick can reach each LOD viewer's
+// frustum + sent levels (the ws Set above only tracks membership).
+const viewerStates = new Map<WebSocket, ConnectionState>();
+// Chunk keys changed by ingest since the last refresh tick, per session. Coalesces a
+// burst of batches into one re-send per chunk per tick.
+const dirtyChunksBySession = new Map<string, Set<string>>();
+const liveRefreshMs = parseIntegerEnv(process.env.LIVE_REFRESH_MS, 500);
 const ingestWss = new WebSocketServer({ noServer: true });
 const viewerWss = new WebSocketServer({ noServer: true });
 
@@ -279,7 +291,8 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
   const { header } = { header: state.pendingBatchHeader };
   state.pendingBatchHeader = undefined;
   const accepted = sessionStore.acceptPointBatch(header, payload);
-  chunkStore.storeAcceptedBatch(accepted);
+  const touchedKeys = chunkStore.storeAcceptedBatch(accepted);
+  markChunksDirty(accepted.session.sessionId, touchedKeys);
 
   send(ws, {
     type: 'point_batch_ack',
@@ -294,6 +307,7 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
 
 function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMode = false): void {
   const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sentLevels: new Map() };
+  viewerStates.set(ws, state);
 
   ws.on('message', (data, isBinary) => {
     try {
@@ -316,6 +330,7 @@ function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMo
   });
 
   ws.on('close', () => {
+    viewerStates.delete(ws);
     detachViewer(ws, state.sessionId);
   });
 
@@ -413,34 +428,20 @@ function sendChunkBootstrap(ws: WebSocket, sessionId: string, worldPoints: Buffe
 function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerViewMessage): void {
   state.sessionId = message.session_id;
   const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
-
   const frustum = buildFrustum(toViewCamera(message));
-  const ladder: LodLadder = {
-    fuseVoxelMeters: chunkStore.fuseVoxelMeters,
-    numLevels: chunkStore.numLevels,
-  };
-  const size = chunkStore.chunkSizeMeters;
+  state.frustum = frustum; // remembered so live refresh can re-evaluate changed chunks
 
   const visible = new Set<string>();
   for (const cell of chunkStore.listSessionChunkKeys(message.session_id)) {
-    const aabb: Aabb = {
-      min: [cell.chunkX * size, cell.chunkY * size, cell.chunkZ * size],
-      max: [(cell.chunkX + 1) * size, (cell.chunkY + 1) * size, (cell.chunkZ + 1) * size],
-    };
-    const level = selectChunkLevel(aabb, frustum, ladder);
+    const level = selectChunkLevel(cellAabb(cell), frustum, currentLadder());
     if (level === null) {
       continue; // culled
     }
     visible.add(cell.chunkKey);
     if (sentLevels.get(cell.chunkKey) === level) {
-      continue; // already at this level — no re-send
+      continue; // already at this level — no re-send on a camera nudge
     }
-    const worldPoints = chunkStore.deriveChunkLevel(message.session_id, cell.chunkKey, level);
-    if (worldPoints.byteLength === 0) {
-      continue;
-    }
-    sendChunkLod(ws, message.session_id, cell.chunkKey, level, worldPoints);
-    sentLevels.set(cell.chunkKey, level);
+    sendChunkAtLevel(ws, message.session_id, cell.chunkKey, level, sentLevels);
   }
 
   for (const chunkKey of [...sentLevels.keys()]) {
@@ -449,6 +450,102 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
       sentLevels.delete(chunkKey);
     }
   }
+}
+
+// Record chunk keys a batch changed so the next refresh tick re-sends them to viewers.
+function markChunksDirty(sessionId: string, chunkKeys: string[]): void {
+  if (chunkKeys.length === 0) {
+    return;
+  }
+  let dirty = dirtyChunksBySession.get(sessionId);
+  if (!dirty) {
+    dirty = new Set();
+    dirtyChunksBySession.set(sessionId, dirty);
+  }
+  for (const key of chunkKeys) {
+    dirty.add(key);
+  }
+}
+
+// Periodic pass: for each session with changed chunks, re-send those chunks to every
+// LOD viewer at the level its current camera calls for (unlike a camera-driven update,
+// a live-dirty chunk is re-sent even when its level is unchanged, because its point data
+// grew). Newly-visible changed chunks are picked up here too; ones that left the view
+// are dropped. This is what makes the base cloud grow without needing camera motion.
+function refreshLiveBases(): void {
+  for (const [sessionId, dirty] of dirtyChunksBySession) {
+    if (dirty.size === 0) {
+      continue;
+    }
+    const viewers = viewerSockets.get(sessionId);
+    if (viewers && viewers.size > 0) {
+      const cells = new Map<string, ChunkCell>(
+        chunkStore.listSessionChunkKeys(sessionId).map((cell) => [cell.chunkKey, cell]),
+      );
+      for (const ws of viewers) {
+        const state = viewerStates.get(ws);
+        if (!state?.lodMode || !state.frustum || ws.readyState !== ws.OPEN) {
+          continue;
+        }
+        for (const chunkKey of dirty) {
+          const cell = cells.get(chunkKey);
+          if (cell) {
+            refreshChunkForViewer(ws, state, sessionId, cell);
+          }
+        }
+      }
+    }
+    dirty.clear();
+  }
+}
+
+// Re-evaluate one changed chunk against a viewer's current frustum: send it at the
+// selected level (always, since its data changed) or drop it if it left the view.
+function refreshChunkForViewer(
+  ws: WebSocket,
+  state: ConnectionState,
+  sessionId: string,
+  cell: ChunkCell,
+): void {
+  const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
+  const level = selectChunkLevel(cellAabb(cell), state.frustum!, currentLadder());
+  if (level === null) {
+    if (sentLevels.has(cell.chunkKey)) {
+      sendChunkDrop(ws, sessionId, cell.chunkKey);
+      sentLevels.delete(cell.chunkKey);
+    }
+    return;
+  }
+  sendChunkAtLevel(ws, sessionId, cell.chunkKey, level, sentLevels);
+}
+
+function currentLadder(): LodLadder {
+  return { fuseVoxelMeters: chunkStore.fuseVoxelMeters, numLevels: chunkStore.numLevels };
+}
+
+function cellAabb(cell: ChunkCell): Aabb {
+  const size = chunkStore.chunkSizeMeters;
+  return {
+    min: [cell.chunkX * size, cell.chunkY * size, cell.chunkZ * size],
+    max: [(cell.chunkX + 1) * size, (cell.chunkY + 1) * size, (cell.chunkZ + 1) * size],
+  };
+}
+
+// Derive a chunk at a level and send it, recording the sent level. No-op for an empty
+// chunk (leaves any prior sent level untouched).
+function sendChunkAtLevel(
+  ws: WebSocket,
+  sessionId: string,
+  chunkKey: string,
+  level: number,
+  sentLevels: Map<string, number>,
+): void {
+  const worldPoints = chunkStore.deriveChunkLevel(sessionId, chunkKey, level);
+  if (worldPoints.byteLength === 0) {
+    return;
+  }
+  sendChunkLod(ws, sessionId, chunkKey, level, worldPoints);
+  sentLevels.set(chunkKey, level);
 }
 
 function toViewCamera(message: ViewerViewMessage): ViewCamera {
@@ -549,6 +646,8 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
   void shutdown('SIGTERM');
 });
+
+setInterval(refreshLiveBases, liveRefreshMs);
 
 server.listen(port, () => {
   console.log(`point-cloud-visualizer listening on http://localhost:${port}`);

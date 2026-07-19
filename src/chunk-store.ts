@@ -167,8 +167,9 @@ export class ChunkStore {
 
   // Transform a batch's local-frame points into the world frame and fuse them into
   // per-chunk voxel grids. Density is bounded by occupied voxels, not by measurement
-  // count, so re-observing a surface adds no points once its voxels are filled.
-  storeAcceptedBatch(accepted: AcceptedBatch): void {
+  // count, so re-observing a surface adds no points once its voxels are filled. Returns
+  // the chunk keys this batch touched, so callers can refresh those chunks for viewers.
+  storeAcceptedBatch(accepted: AcceptedBatch): string[] {
     const payload = accepted.payload;
     const sessionId = accepted.session.sessionId;
     const [tx, ty, tz] = accepted.pose.pose.translation_m;
@@ -240,6 +241,12 @@ export class ChunkStore {
     }
 
     this.syncSession(accepted.session);
+
+    const touchedKeys: string[] = [];
+    for (const active of touched) {
+      touchedKeys.push(active.chunkKey);
+    }
+    return touchedKeys;
   }
 
   flushSession(sessionId: string): void {
