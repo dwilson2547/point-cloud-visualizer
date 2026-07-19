@@ -71,46 +71,147 @@ count*. This is the single biggest scale lever and it drops in behind the existi
 
 ### 2b — LOD pyramid + view-driven streaming (potree-like)
 
-**Idea:** build coarser levels above the fused fine grid and stream per-chunk detail matched to how
-much screen space the chunk occupies. Far/zoomed-out → coarse; near/zoomed-in → fine.
+**Idea:** derive coarser levels above the fused fine grid and stream each chunk at a detail matched
+to how much screen space it occupies. Far/zoomed-out → coarse; near/zoomed-in → fine. Most chunks
+never load at full resolution, so a building-scale cloud stays interactive.
 
-**Level structure — two candidates (decide at 2b start, not now):**
+#### Decision 1 — mip-per-chunk pyramid, not an additive octree
 
-1. **Additive octree (potree/Entwine model).** Each point belongs to exactly one node: the coarsest
-   level whose cell it can still claim; if the cell is taken, descend and claim a child. Rendering
-   levels `0..L` shows increasing detail with **no double-counting and no re-sends on refine** —
-   refining a chunk sends only the next level's *additional* points. Best bandwidth and the truest
-   potree feel; more complex incremental insertion and state.
-2. **Mip pyramid (per-chunk, per-level re-voxelization).** Level `k` voxel size = `base * 2^k`,
-   independently fused. Refining a chunk *replaces* its points with the finer level. Simple to
-   reason about and implement; costs a re-send on each refine step.
+Two candidate level structures:
 
-Recommendation: target the **additive octree** because it's the experience the user asked for and
-avoids refine re-sends, but a **mip-per-chunk** first cut is acceptable if additive insertion proves
-fiddly under streaming.
+1. **Additive octree (potree/Entwine).** Each point belongs to exactly one node; refining a chunk
+   sends only the *additional* points the finer level introduces. Best bandwidth, truest potree
+   feel — but incremental insertion is stateful, and under **mutation** (points keep arriving and
+   re-fusing) you must re-decide which point owns each cell as the underlying data shifts.
+2. **Mip-per-chunk.** Level `ℓ` is an independent re-voxelization of the chunk's fine grid at voxel
+   size `fineVoxel · 2^(Lmax−ℓ)`. Refining *replaces* a chunk's points with the finer level.
 
-**Serving changes (protocol additions):**
+**Chosen: mip-per-chunk.** Rationale, weighted for our *live, mutable* store (the thing that makes
+this not-potree):
 
-- New viewer→server message `viewer_view` (camera position, orientation, fov, viewport px), sent
-  throttled (~5–10 Hz) as the camera moves.
-- Per-chunk LOD selection server-side: project voxel size to screen space (or bucket by distance);
-  pick the level where a voxel is ~1–2 px.
-- Chunk/level delivery keyed by `(chunkKey, level)` so the viewer can swap or stack a chunk's points
-  (replace for mip, append for additive). Frustum-cull off-screen chunks entirely.
+- **Mutation-friendly.** When a chunk's fine voxels change, coarse levels are just re-derived by
+  re-binning — no ownership rebalancing. Additive octree updates are genuinely hard under mutation.
+- **Trivial derivation.** Coarse voxel bounds are powers-of-two multiples of the fine voxel, so they
+  nest exactly. Build the pyramid bottom-up: level `ℓ` from `ℓ+1` by 2×2×2 mean-binning. This reuses
+  the 2a accumulator math directly.
+- **Bounded re-send cost.** For *surfaces* (2-D manifolds), level `ℓ` has ~4× the points of `ℓ−1`,
+  so the finest level dominates; the sum of all coarser levels is ≈ ⅓ of the finest. Mip's "waste"
+  from re-sending on refine is therefore ~33% **and only for chunks the camera actually approaches
+  to full detail** — distant chunks never refine. Acceptable for the simplicity and mutability win.
 
-**Viewer changes:** replace the single global ring buffer with per-chunk GPU buffers (or a slab
-allocator) so individual chunks can be upgraded/downgraded/evicted independently. Send `viewer_view`
-on camera settle.
+Additive octree stays on the table as a later bandwidth optimization if refine re-sends ever measure
+as a real bottleneck. Not now.
 
-## Recommendation
+#### Decision 2 — two-layer viewer: LOD base + live overlay
 
-Build **2a first** — biggest scale win, self-contained, no protocol/viewer churn, immediately
-shrinks bootstrap. Then design **2b** as its own milestone (protocol + viewer changes), resolving
-additive-vs-mip at that point.
+The tension: LOD serving is **chunk-oriented** (send chunk X at level ℓ), but live deltas are
+**batch-oriented** (a batch spans several chunks, carries local-frame points + one pose) and must
+render at low latency. Forcing live updates through per-chunk re-sends would add settle latency and
+kill the real-time feel.
+
+Resolution — the two-layer viewer from [`architecture.md`](./architecture.md) §5:
+
+- **Base layer** — per-chunk GPU buffers, view-driven LOD. Fed by `chunk_lod` (replace a chunk's
+  points) and `chunk_drop` (free a chunk). This is the accumulated, LOD'd world.
+- **Live overlay** — the **existing client ring buffer, reused unchanged**, fed by the current
+  batch-oriented `chunk_update` deltas. Short-lived, bounded, renders the newest points instantly.
+
+The live ring we already have *becomes* the overlay; 2b only *adds* the base layer. A point briefly
+appears in both while the sensor is actively scanning a region (overlay still holds it, base already
+refreshed) → a transient, harmless density bump in exactly the active-scan area. A watermark-based
+de-dup can remove even that later; not needed for v1.
+
+#### Data model
+
+- Level ladder: `fineVoxelMeters` (2a's 0.04) and `numLevels` (~6 → coarsest voxel ≈ 2.56 m ≈ one
+  point per 2 m chunk). Level 0 = coarsest (potree convention), `Lmax` = finest = the 2a grid.
+- **Levels are derived on demand from the fine voxel set, not persisted.** Resident chunk → derive
+  from its in-memory voxels; resting chunk → read its fine `.bin` and derive. No pyramid files, so
+  nothing to invalidate when fine data mutates — always current. A per-`(chunk,level)` cache is a
+  later optimization if derivation cost shows up under many viewers.
+
+#### Serving
+
+Per **viewer**, the server tracks the last view and the level currently sent for each chunk. On a
+throttled `viewer_view`:
+
+1. Build camera + frustum from the message.
+2. For each session chunk (use the stored AABB `min/max`), frustum-cull and range-cull; for
+   survivors, pick a target level from projected voxel size — roughly
+   `screenPx ≈ voxelSize / distance · viewportH / (2·tan(fovY/2))`, choose the level giving ~1–2 px.
+3. Diff against per-viewer sent-state: newly visible or level changed → send `chunk_lod` + payload;
+   left frustum/range → send `chunk_drop`. Update sent-state.
+
+The viewer also frustum-culls per object (cheap draw-call reduction); the server cull is about
+**bandwidth** (don't ship far chunks), the viewer cull about **draw cost**.
+
+Live base freshness: when new points fuse into a chunk, mark it dirty for viewers holding it and
+re-send at their current level, coalesced/throttled. The live overlay masks base staleness in the
+meantime, so v1 can start with a simple periodic "re-send changed visible chunks" pass.
+
+#### Protocol additions (`protocol.ts`)
+
+```ts
+// client → server, throttled (~5–10 Hz) on camera settle
+interface ViewerViewMessage {
+  type: 'viewer_view';
+  session_id: string;
+  position: [number, number, number];      // camera, world frame
+  forward: [number, number, number];       // view direction
+  up: [number, number, number];
+  fov_y_rad: number;
+  viewport_px: [number, number];           // width, height
+  near_m: number; far_m: number;
+}
+
+// server → client — evolves chunk_bootstrap: now carries chunk_key + level so the
+// viewer can key a GPU buffer per chunk and replace/drop it. Binary payload follows.
+interface ChunkLodMessage {
+  type: 'chunk_lod';
+  session_id: string;
+  chunk_key: string;
+  level: number;
+  point_count: number;
+  point_format: string;
+  stride_bytes: number;
+}
+interface ChunkDropMessage {
+  type: 'chunk_drop';
+  session_id: string;
+  chunk_key: string;
+}
+```
+
+#### Implementation ladder
+
+Each rung is independently reviewable and (for the server logic) unit-testable:
+
+- **2b-1 — LOD derivation (server, no protocol change).** `ChunkStore.deriveChunkLevel(sessionId,
+  chunkKey, level)`: mean-bin the fine voxels to a coarser grid (resident or from disk). Test:
+  coarser level has ≤ fine count, representatives are child-voxel means, bounds preserved, nesting
+  is exact. Pure and fully testable — the foundation.
+- **2b-2 — level ladder + selection math (server).** `numLevels`, per-chunk `selectLevel(aabb,
+  camera)` screen-space projection, frustum/range tests. Test: near→fine, far→coarse, monotonic.
+- **2b-3 — protocol + `viewer_view` plumbing.** Add the three messages; server keeps per-viewer
+  sent-state and emits `chunk_lod`/`chunk_drop` diffs; replace the eager full-bootstrap with
+  view-driven serving (send coarsest in-range as a default until the first `viewer_view` arrives).
+- **2b-4 — viewer base layer.** Per-chunk GPU buffers keyed by `chunk_key`; handle `chunk_lod`
+  (replace) / `chunk_drop` (dispose); send `viewer_view` on camera settle. Live overlay unchanged.
+- **2b-5 — live base refresh.** Periodic re-send of changed visible chunks at each viewer's level.
+
+## Status / recommendation
+
+- **2a — done.** Voxel fusion landed; density bounded; serving path unchanged.
+- **2b — designed above.** Decisions made: **mip-per-chunk** (not additive octree) for
+  mutability + simplicity, and a **two-layer viewer** (LOD base + reused live-ring overlay). Build
+  the ladder 2b-1 → 2b-5; the first two rungs are pure server logic and make good standalone tasks.
 
 ## Open questions
 
 - Fuse color/intensity by mean, or keep most-recent (freshness vs. denoising)? Default mean.
-- Should the **live** delta path also fuse (bounded live cloud) once per-chunk viewer buffers land
-  in 2b, retiring the client ring buffer entirely? Likely yes.
-- Voxel size per session vs. global default — room-scale vs. building-scale want different bases.
+- Retire the client ring buffer once the base layer exists, or keep it as the live overlay?
+  Current plan: **keep it** as the overlay (Decision 2).
+- Voxel size / `numLevels` per session vs. global default — room-scale vs. building-scale want
+  different bases.
+- Draw-call ceiling: one `THREE.Points` per chunk is simplest but caps at ~1–2k chunks; move to a
+  slab allocator (shared geometry, managed sub-ranges) if the count bites.
