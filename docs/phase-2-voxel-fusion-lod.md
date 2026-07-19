@@ -196,9 +196,11 @@ Each rung is independently reviewable and (for the server logic) unit-testable:
   per-viewer sent-level state (`ChunkStore.listSessionChunkKeys` unions resident + persisted cells,
   cull/level via the cell AABB) and emits `chunk_lod`/`chunk_drop` diffs on each `viewer_view`.
   Plain viewers keep the full-bootstrap path. Live `chunk_update` still broadcasts to all viewers.
-- **2b-4 — viewer base layer.** Per-chunk GPU buffers keyed by `chunk_key`; handle `chunk_lod`
-  (replace) / `chunk_drop` (dispose); connect with `?lod=1` and send `viewer_view` on camera settle.
-  Live overlay (the existing ring buffer) unchanged.
+- **2b-4 — viewer base layer. Done.** `viewer.js` split into a per-`chunk_key` base layer
+  (one `THREE.Points` each, replaced on `chunk_lod`, disposed on `chunk_drop`, frustum-culled per
+  object) and the existing ring buffer as the live overlay (fed by `chunk_update`). Connects with
+  `?lod=1` and emits `viewer_view` on camera settle (~5 Hz). Verified in-browser: 74 chunks /
+  313k pts loaded from `chunk_lod` alone, and zooming culled to 53 chunks via `chunk_drop`.
 - **2b-5 — live base refresh.** Periodic re-send of changed visible chunks at each viewer's level.
 
 ## Status / recommendation
