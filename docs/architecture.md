@@ -50,6 +50,10 @@ An initial session should likely contain:
 This makes it possible to persist multiple recordings independently and reopen or append to an
 existing world model intentionally.
 
+Session counters and chunk metadata are stored in SQLite and restored at server startup. Pose bodies
+remain bounded active-session state rather than durable history: a resumed publisher establishes a
+fresh pose before sending more points.
+
 ### 2. Fusion layer
 
 Server-side processing is responsible for:
@@ -72,6 +76,10 @@ options are:
 - chunk manifests backed by object storage plus a metadata database
 
 The live store should be the system of record. Potree-compatible output should be a derived product.
+
+For the v1 durability boundary, a point-batch ACK is emitted only after all touched chunk files have
+been atomically replaced and the corresponding session sequence has been persisted. Publishers use
+that ACK for flow control and keep one batch in flight.
 
 ### 4. Serving layer
 

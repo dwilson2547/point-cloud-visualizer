@@ -44,7 +44,13 @@ let sessionReady = false;
 let sequence = 0;
 let poseSequence = 0;
 let pendingPackets: PendingPacket[] = [];
+let inFlightPackets: PendingPacket[] = [];
 let flushedBatches = 0;
+let batchInFlight = false;
+let droppedPackets = 0;
+let shutdownRequested = false;
+let shutdownTimer: NodeJS.Timeout | undefined;
+const maxPendingPackets = options.batchPackets * 20;
 
 ws.on('open', () => {
   ws.send(
@@ -80,37 +86,30 @@ ws.on('message', (raw) => {
 
   if (message.type === 'session_ack') {
     sequence = message.resume_from_sequence - 1;
-    poseSequence = nextSequence();
-    ws.send(
-      JSON.stringify({
-        type: 'pose_update',
-        session_id: options.sessionId,
-        publisher_id: options.publisherId,
-        sequence: poseSequence,
-        timestamp: new Date().toISOString(),
-        pose: {
-          translation_m: [0, 0, 0],
-          rotation_xyzw: [0, 0, 0, 1],
-        },
-      }),
-    );
     sessionReady = true;
     console.log(`Session ${options.sessionId} ready, listening on UDP ${options.udpPort}`);
     return;
   }
 
   if (message.type === 'point_batch_ack') {
+    batchInFlight = false;
+    inFlightPackets = [];
     flushedBatches += 1;
     if (flushedBatches % 25 === 0) {
       console.log(
         `Published ${flushedBatches} point batches (${message.accepted_points} points in latest batch)`,
       );
     }
+    if (shutdownRequested) {
+      drainAndClose();
+    } else {
+      flushPendingPackets();
+    }
     return;
   }
 
   if (message.type === 'error') {
-    console.error(`Server error [${message.code}]: ${message.message}`);
+    abort(`Server error [${message.code}]: ${message.message}`);
   }
 });
 
@@ -120,7 +119,15 @@ ws.on('error', (error) => {
 
 ws.on('close', () => {
   console.log('WebSocket closed');
-  socket.close();
+  clearInterval(flushInterval);
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = undefined;
+  }
+  closeUdpSocket();
+  if (!shutdownRequested && (batchInFlight || pendingPackets.length > 0)) {
+    process.exitCode = 1;
+  }
 });
 
 socket.on('message', (packet) => {
@@ -133,8 +140,15 @@ socket.on('message', (packet) => {
     if (parsed.pointCount === 0) {
       return;
     }
+    if (pendingPackets.length >= maxPendingPackets) {
+      droppedPackets += 1;
+      if (droppedPackets === 1 || droppedPackets % 100 === 0) {
+        console.error(`Dropped ${droppedPackets} lidar packets while waiting for server acknowledgements`);
+      }
+      return;
+    }
     pendingPackets.push(parsed);
-    if (pendingPackets.length >= options.batchPackets) {
+    if (pendingPackets.length >= options.batchPackets && !batchInFlight) {
       flushPendingPackets();
     }
   } catch (error) {
@@ -159,14 +173,21 @@ const flushInterval = setInterval(() => {
   }
 }, 100);
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', beginShutdown);
+process.on('SIGTERM', beginShutdown);
 
 function flushPendingPackets(): void {
-  if (pendingPackets.length === 0) {
+  if (
+    pendingPackets.length === 0 ||
+    batchInFlight ||
+    ws.readyState !== WebSocket.OPEN ||
+    ws.bufferedAmount > 4 * 1024 * 1024
+  ) {
     return;
   }
 
+  const packets = pendingPackets.splice(0, options.batchPackets);
+  inFlightPackets = packets;
   let pointCount = 0;
   let totalBytes = 0;
   let minX = Number.POSITIVE_INFINITY;
@@ -176,7 +197,7 @@ function flushPendingPackets(): void {
   let maxY = Number.NEGATIVE_INFINITY;
   let maxZ = Number.NEGATIVE_INFINITY;
 
-  for (const batch of pendingPackets) {
+  for (const batch of packets) {
     pointCount += batch.pointCount;
     totalBytes += batch.payload.byteLength;
     minX = Math.min(minX, batch.boundsLocal.min[0]);
@@ -188,15 +209,30 @@ function flushPendingPackets(): void {
   }
 
   const payload = Buffer.concat(
-    pendingPackets.map((batch) => batch.payload),
+    packets.map((batch) => batch.payload),
     totalBytes,
+  );
+  poseSequence = nextSequence();
+  const timestamp = new Date().toISOString();
+  ws.send(
+    JSON.stringify({
+      type: 'pose_update',
+      session_id: options.sessionId,
+      publisher_id: options.publisherId,
+      sequence: poseSequence,
+      timestamp,
+      pose: {
+        translation_m: [0, 0, 0],
+        rotation_xyzw: [0, 0, 0, 1],
+      },
+    }),
   );
   const header: PointBatchHeaderMessage = {
     type: 'point_batch_header',
     session_id: options.sessionId,
     publisher_id: options.publisherId,
     sequence: nextSequence(),
-    timestamp: new Date().toISOString(),
+    timestamp,
     pose_sequence: poseSequence,
     point_count: pointCount,
     point_format: POINT_FORMAT,
@@ -211,7 +247,7 @@ function flushPendingPackets(): void {
 
   ws.send(JSON.stringify(header));
   ws.send(payload, { binary: true });
-  pendingPackets = [];
+  batchInFlight = true;
 }
 
 function nextSequence(): number {
@@ -279,10 +315,26 @@ function usage(): string {
   ].join('\n');
 }
 
-function shutdown(): void {
+function beginShutdown(): void {
+  if (shutdownRequested) {
+    return;
+  }
+  shutdownRequested = true;
   clearInterval(flushInterval);
+  closeUdpSocket();
+  shutdownTimer = setTimeout(() => {
+    abort('Timed out waiting for queued lidar data to be acknowledged during shutdown');
+  }, 10_000);
+  drainAndClose();
+}
+
+function drainAndClose(): void {
+  if (batchInFlight) {
+    return;
+  }
   if (pendingPackets.length > 0 && sessionReady && ws.readyState === WebSocket.OPEN) {
     flushPendingPackets();
+    return;
   }
   if (sessionReady && ws.readyState === WebSocket.OPEN) {
     ws.send(
@@ -293,9 +345,41 @@ function shutdown(): void {
         sequence: nextSequence(),
       }),
     );
+    sessionReady = false;
   }
-  socket.close();
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = undefined;
+  }
   ws.close();
+}
+
+function abort(message: string): void {
+  console.error(message);
+  console.error(`Aborting with ${inFlightPackets.length} unacknowledged and ${pendingPackets.length} queued packets`);
+  clearInterval(flushInterval);
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = undefined;
+  }
+  process.exitCode = 1;
+  closeUdpSocket();
+  ws.close();
+}
+
+function closeUdpSocket(): void {
+  try {
+    socket.close();
+  } catch (error) {
+    if (
+      typeof error !== 'object' ||
+      error === null ||
+      !('code' in error) ||
+      (error as { code?: unknown }).code !== 'ERR_SOCKET_DGRAM_NOT_RUNNING'
+    ) {
+      throw error;
+    }
+  }
 }
 
 function getErrorMessage(error: unknown): string {

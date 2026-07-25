@@ -205,7 +205,9 @@ code is published as stable.
 
 ### `point_batch_ack`
 
-Sent by the server after a batch has been accepted.
+Sent by the server after a batch has been validated, fused into its touched chunks, atomically
+written to chunk files, and committed to persisted session sequence state. The current server
+therefore treats this as a process-restart-safe acceptance boundary.
 
 ```json
 {
@@ -264,6 +266,12 @@ Sent by the server when it rejects a request or detects a protocol violation.
 - The server may reject duplicate or out-of-order messages
 - `pose_update` and `point_batch_header` are independently sequenced in the same session stream
 - A `point_batch_header` references the pose to use via `pose_sequence`
+- A publisher keeps at most one point batch in flight and waits for `point_batch_ack` before sending
+  another batch
+- After `resume_session`, the publisher sends a fresh `pose_update`; old pose bodies are not retained
+  across server restarts
+- `last_client_sequence` may trail the server when an ACK was lost, but it may not be ahead of the
+  persisted server sequence
 
 This gives the server a deterministic resume point and avoids ambiguity during reconnects.
 
@@ -293,6 +301,18 @@ The server should reject or flag:
 - unknown referenced `pose_sequence`
 - unsupported `units`
 - NaN or infinite coordinates
+- invalid or non-normalized pose quaternions
+- unsafe session or publisher identifiers
+- batches exceeding the configured point limit
+- batches spanning more than the configured spatial chunk limit
+- invalid viewer camera/FOV/viewport ranges
+
+## Flow control
+
+Publishers use the ACK as their backpressure signal and keep one batch in flight. Viewers that stop
+consuming data are disconnected with WebSocket close code `1013` before the configured outbound
+buffer limit is exceeded; they may reconnect and reconstruct the current base layer from persisted
+chunks.
 
 ## Deferred items
 

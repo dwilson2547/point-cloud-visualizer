@@ -22,6 +22,8 @@ const batchesPerSecond = Number.parseInt(args.get('rate') ?? '15', 10);
 
 const ws = new WebSocket(url);
 let sequence = 0;
+let batchInFlight = false;
+let emitTimer: NodeJS.Timeout | undefined;
 const startedAt = Date.now();
 
 ws.on('open', () => {
@@ -41,16 +43,27 @@ ws.on('message', (data) => {
   if (msg.type === 'session_ack' && msg.accepted) {
     console.log(`session ${sessionId} accepted — streaming ${pointsPerBatch} pts x ${batchesPerSecond}/s`);
     console.log(`viewer: http://localhost:8080/?session_id=${encodeURIComponent(sessionId)}`);
-    setInterval(emitFrame, Math.max(1, Math.round(1000 / batchesPerSecond)));
+    emitTimer = setInterval(emitFrame, Math.max(1, Math.round(1000 / batchesPerSecond)));
+  } else if (msg.type === 'point_batch_ack') {
+    batchInFlight = false;
   } else if (msg.type === 'error') {
     console.error('server error:', msg.message);
+    ws.close();
+    process.exitCode = 1;
   }
 });
 
 ws.on('error', (err) => console.error('ws error:', err.message));
-ws.on('close', () => process.exit(0));
+ws.on('close', () => {
+  if (emitTimer) {
+    clearInterval(emitTimer);
+  }
+});
 
 function emitFrame(): void {
+  if (batchInFlight || ws.bufferedAmount > 4 * 1024 * 1024) {
+    return;
+  }
   const t = (Date.now() - startedAt) / 1000;
   const yaw = t * 0.8;
   const pose = {
@@ -84,6 +97,7 @@ function emitFrame(): void {
     stride_bytes: POINT_STRIDE_BYTES,
   });
   ws.send(payload);
+  batchInFlight = true;
 }
 
 // A spherical shell (radius ~4 m) sampled in the sensor's local frame, colored by

@@ -24,7 +24,7 @@ import {
   type ViewerJoinMessage,
   type ViewerViewMessage,
 } from './protocol.js';
-import { ChunkStore } from './chunk-store.js';
+import { ChunkStore, DurableBatchError } from './chunk-store.js';
 import { SessionStore } from './session-store.js';
 import {
   buildFrustum,
@@ -46,12 +46,22 @@ interface ConnectionState {
   lodMode?: boolean;
   sentLevels?: Map<string, number>;
   frustum?: Frustum;
+  lastViewAt?: number;
+}
+
+class StorageOperationError extends Error {
+  constructor(message: string, options: ErrorOptions) {
+    super(message, options);
+    this.name = 'StorageOperationError';
+  }
 }
 
 type ChunkCell = { chunkKey: string; chunkX: number; chunkY: number; chunkZ: number };
 
 const port = parseIntegerEnv(process.env.PORT, 8080);
-const sessionStore = new SessionStore();
+const maxPointsPerBatch = parseIntegerEnv(process.env.MAX_POINTS_PER_BATCH, 1_000_000);
+const maxViewerBufferedBytes = parseIntegerEnv(process.env.MAX_VIEWER_BUFFERED_BYTES, 32 * 1024 * 1024);
+const maxRetainedPoses = parseIntegerEnv(process.env.MAX_RETAINED_POSES, 64);
 const chunkStore = new ChunkStore({
   rootDir: path.resolve(process.env.DATA_DIR ?? 'data'),
   chunkSizeMeters: parseFloatEnv(process.env.CHUNK_SIZE_METERS, 2),
@@ -59,8 +69,12 @@ const chunkStore = new ChunkStore({
   numLevels: parseIntegerEnv(process.env.LOD_LEVELS, 6),
   flushPointThreshold: parseIntegerEnv(process.env.FLUSH_POINT_THRESHOLD, 50_000),
   maxDirtyChunks: parseIntegerEnv(process.env.MAX_DIRTY_CHUNKS, 128),
+  maxChunksPerBatch: parseIntegerEnv(process.env.MAX_CHUNKS_PER_BATCH, 128),
 });
+const sessionStore = new SessionStore({ maxPointsPerBatch, maxRetainedPoses });
+sessionStore.restoreSessions(chunkStore.loadSessions());
 const viewerSockets = new Map<string, Set<WebSocket>>();
+const publisherSockets = new Map<string, WebSocket>();
 // Per-viewer connection state, so the live-refresh tick can reach each LOD viewer's
 // frustum + sent levels (the ws Set above only tracks membership).
 const viewerStates = new Map<WebSocket, ConnectionState>();
@@ -68,8 +82,10 @@ const viewerStates = new Map<WebSocket, ConnectionState>();
 // burst of batches into one re-send per chunk per tick.
 const dirtyChunksBySession = new Map<string, Set<string>>();
 const liveRefreshMs = parseIntegerEnv(process.env.LIVE_REFRESH_MS, 500);
-const ingestWss = new WebSocketServer({ noServer: true });
-const viewerWss = new WebSocketServer({ noServer: true });
+let shuttingDown = false;
+const maxPayloadBytes = Math.max(64 * 1024, maxPointsPerBatch * POINT_STRIDE_BYTES);
+const ingestWss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
+const viewerWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
 // Static viewer assets live in <project>/public; resolve relative to this module
 // so it works from both src/ (tsx) and dist/ (built).
@@ -200,8 +216,14 @@ server.on('upgrade', (req, socket, head) => {
 
 function configureIngestSocket(ws: WebSocket): void {
   const state: ConnectionState = { role: INGEST_ROLE };
+  ws.on('error', (error) => {
+    console.error(`Ingest WebSocket error: ${error.message}`);
+  });
 
   ws.on('message', (data, isBinary) => {
+    if (shuttingDown) {
+      return;
+    }
     try {
       if (isBinary) {
         handlePointBatchBinary(ws, state, data);
@@ -209,7 +231,16 @@ function configureIngestSocket(ws: WebSocket): void {
       }
       handleIngestText(ws, state, data.toString());
     } catch (error) {
+      if (error instanceof DurableBatchError || error instanceof StorageOperationError) {
+        failFastOnStorageError(ws, error);
+        return;
+      }
       send(ws, makeError('protocol_error', getErrorMessage(error), true, state.sessionId));
+    }
+  });
+  ws.on('close', () => {
+    if (state.sessionId && publisherSockets.get(state.sessionId) === ws) {
+      publisherSockets.delete(state.sessionId);
     }
   });
 }
@@ -219,10 +250,12 @@ function handleIngestText(ws: WebSocket, state: ConnectionState, payload: string
 
   switch (message.type) {
     case 'create_session': {
+      requireUnboundPublisher(state);
       const session = sessionStore.createSession(message);
-      chunkStore.syncSession(session);
+      runStorageOperation('persist created session', () => chunkStore.syncSession(session));
       state.sessionId = session.sessionId;
       state.publisherId = session.publisherId;
+      publisherSockets.set(session.sessionId, ws);
       send(ws, {
         type: 'session_ack',
         session_id: session.sessionId,
@@ -234,10 +267,15 @@ function handleIngestText(ws: WebSocket, state: ConnectionState, payload: string
       return;
     }
     case 'resume_session': {
+      requireUnboundPublisher(state);
+      if (publisherSockets.has(message.session_id)) {
+        throw new Error(`Session ${message.session_id} already has an active publisher`);
+      }
       const session = sessionStore.resumeSession(message);
-      chunkStore.syncSession(session);
+      runStorageOperation('persist resumed session', () => chunkStore.syncSession(session));
       state.sessionId = session.sessionId;
       state.publisherId = session.publisherId;
+      publisherSockets.set(session.sessionId, ws);
       send(ws, {
         type: 'session_ack',
         session_id: session.sessionId,
@@ -249,13 +287,15 @@ function handleIngestText(ws: WebSocket, state: ConnectionState, payload: string
       return;
     }
     case 'pose_update': {
+      requireBoundPublisher(state, message.session_id, message.publisher_id);
       const session = sessionStore.applyPoseUpdate(message);
-      chunkStore.syncSession(session);
+      runStorageOperation('persist pose sequence', () => chunkStore.syncSession(session));
       state.sessionId = message.session_id;
       state.publisherId = message.publisher_id;
       return;
     }
     case 'point_batch_header': {
+      requireBoundPublisher(state, message.session_id, message.publisher_id);
       if (state.pendingBatchHeader) {
         throw new Error('Received point_batch_header while previous batch is still pending');
       }
@@ -271,9 +311,12 @@ function handleIngestText(ws: WebSocket, state: ConnectionState, payload: string
       return;
     }
     case 'close_session': {
+      requireBoundPublisher(state, message.session_id, message.publisher_id);
       const session = sessionStore.closeSession(message.session_id, message.publisher_id, message.sequence);
-      chunkStore.syncSession(session);
-      chunkStore.flushSession(message.session_id);
+      runStorageOperation('persist closed session', () => {
+        chunkStore.flushSession(message.session_id);
+        chunkStore.syncSession(session);
+      });
       state.pendingBatchHeader = undefined;
       return;
     }
@@ -290,8 +333,16 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
   const payload = normalizeRawData(data);
   const { header } = { header: state.pendingBatchHeader };
   state.pendingBatchHeader = undefined;
-  const accepted = sessionStore.acceptPointBatch(header, payload);
-  const touchedKeys = chunkStore.storeAcceptedBatch(accepted);
+  const accepted = sessionStore.preparePointBatch(header, payload);
+  const nextSession = {
+    ...accepted.session,
+    pointBatches: accepted.session.pointBatches + 1,
+    totalPoints: accepted.session.totalPoints + accepted.header.point_count,
+    lastSequence: accepted.header.sequence,
+    lastSeenAt: accepted.header.timestamp,
+  };
+  const touchedKeys = chunkStore.storeAcceptedBatchDurably(accepted, nextSession);
+  sessionStore.commitPointBatch(accepted);
   markChunksDirty(accepted.session.sessionId, touchedKeys);
 
   send(ws, {
@@ -308,8 +359,14 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
 function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMode = false): void {
   const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sentLevels: new Map() };
   viewerStates.set(ws, state);
+  ws.on('error', (error) => {
+    console.error(`Viewer WebSocket error: ${error.message}`);
+  });
 
   ws.on('message', (data, isBinary) => {
+    if (shuttingDown) {
+      return;
+    }
     try {
       if (isBinary) {
         throw new Error('Viewer endpoint does not accept binary client messages');
@@ -343,6 +400,11 @@ function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMo
 }
 
 function attachViewer(ws: WebSocket, state: ConnectionState, message: ViewerJoinMessage): void {
+  if (state.sessionId && state.sessionId !== message.session_id) {
+    detachViewer(ws, state.sessionId);
+    state.sentLevels?.clear();
+    state.frustum = undefined;
+  }
   state.sessionId = message.session_id;
   let viewers = viewerSockets.get(message.session_id);
   if (!viewers) {
@@ -358,8 +420,10 @@ function attachViewer(ws: WebSocket, state: ConnectionState, message: ViewerJoin
   if (state.lodMode) {
     return;
   }
-  for (const worldPoints of chunkStore.readSessionWorldChunks(message.session_id)) {
-    sendChunkBootstrap(ws, message.session_id, worldPoints);
+  for (const worldPoints of chunkStore.iterateSessionWorldChunks(message.session_id)) {
+    if (!sendChunkBootstrap(ws, message.session_id, worldPoints)) {
+      break;
+    }
   }
 }
 
@@ -394,7 +458,7 @@ function sendChunkUpdate(
   header: PointBatchHeaderMessage,
   payload: Buffer,
   pose: Pose,
-): void {
+): boolean {
   const message: ChunkUpdateMessage = {
     type: 'chunk_update',
     session_id: header.session_id,
@@ -406,11 +470,10 @@ function sendChunkUpdate(
     timestamp: header.timestamp,
     pose,
   };
-  send(ws, message);
-  ws.send(payload, { binary: true });
+  return sendPair(ws, message, payload);
 }
 
-function sendChunkBootstrap(ws: WebSocket, sessionId: string, worldPoints: Buffer): void {
+function sendChunkBootstrap(ws: WebSocket, sessionId: string, worldPoints: Buffer): boolean {
   const message: ChunkBootstrapMessage = {
     type: 'chunk_bootstrap',
     session_id: sessionId,
@@ -418,14 +481,24 @@ function sendChunkBootstrap(ws: WebSocket, sessionId: string, worldPoints: Buffe
     point_format: POINT_FORMAT,
     stride_bytes: POINT_STRIDE_BYTES,
   };
-  send(ws, message);
-  ws.send(worldPoints, { binary: true });
+  return sendPair(ws, message, worldPoints);
 }
 
 // Recompute the LOD base layer for a viewer against its latest camera: for each chunk
 // cell, cull or pick a level, and send only the diffs — a chunk_lod when its level
 // changed (or it is newly visible) and a chunk_drop when it left the view.
 function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerViewMessage): void {
+  if (!state.lodMode) {
+    throw new Error('viewer_view requires an LOD-mode connection');
+  }
+  if (state.sessionId && state.sessionId !== message.session_id) {
+    throw new Error('viewer_view session_id does not match the joined session');
+  }
+  const now = Date.now();
+  if (state.lastViewAt !== undefined && now - state.lastViewAt < 100) {
+    return;
+  }
+  state.lastViewAt = now;
   state.sessionId = message.session_id;
   const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
   const frustum = buildFrustum(toViewCamera(message));
@@ -544,8 +617,9 @@ function sendChunkAtLevel(
   if (worldPoints.byteLength === 0) {
     return;
   }
-  sendChunkLod(ws, sessionId, chunkKey, level, worldPoints);
-  sentLevels.set(chunkKey, level);
+  if (sendChunkLod(ws, sessionId, chunkKey, level, worldPoints)) {
+    sentLevels.set(chunkKey, level);
+  }
 }
 
 function toViewCamera(message: ViewerViewMessage): ViewCamera {
@@ -564,6 +638,19 @@ function toViewCamera(message: ViewerViewMessage): ViewCamera {
   if (![message.fov_y_rad, message.near_m, message.far_m].every((n) => Number.isFinite(n))) {
     throw new Error('viewer_view requires finite fov_y_rad, near_m, and far_m');
   }
+  if (Math.hypot(...message.forward) < 1e-9 || Math.hypot(...message.up) < 1e-9) {
+    throw new Error('viewer_view forward and up vectors must be non-zero');
+  }
+  if (
+    message.viewport_px[0] <= 0 ||
+    message.viewport_px[1] <= 0 ||
+    message.fov_y_rad <= 0 ||
+    message.fov_y_rad >= Math.PI ||
+    message.near_m <= 0 ||
+    message.far_m <= message.near_m
+  ) {
+    throw new Error('viewer_view requires a positive viewport, valid FOV, and 0 < near_m < far_m');
+  }
   return {
     position: message.position,
     forward: message.forward,
@@ -581,7 +668,7 @@ function sendChunkLod(
   chunkKey: string,
   level: number,
   worldPoints: Buffer,
-): void {
+): boolean {
   const message: ChunkLodMessage = {
     type: 'chunk_lod',
     session_id: sessionId,
@@ -591,8 +678,7 @@ function sendChunkLod(
     point_format: POINT_FORMAT,
     stride_bytes: POINT_STRIDE_BYTES,
   };
-  send(ws, message);
-  ws.send(worldPoints, { binary: true });
+  return sendPair(ws, message, worldPoints);
 }
 
 function sendChunkDrop(ws: WebSocket, sessionId: string, chunkKey: string): void {
@@ -604,12 +690,57 @@ function sendChunkDrop(ws: WebSocket, sessionId: string, chunkKey: string): void
   send(ws, message);
 }
 
-function send(ws: WebSocket, message: ServerMessage): void {
+function send(ws: WebSocket, message: ServerMessage): boolean {
+  if (!canSend(ws, 0)) {
+    return false;
+  }
   ws.send(JSON.stringify(message));
+  return true;
+}
+
+function sendPair(ws: WebSocket, message: ServerMessage, payload: Buffer): boolean {
+  const control = JSON.stringify(message);
+  if (!canSend(ws, Buffer.byteLength(control) + payload.byteLength)) {
+    return false;
+  }
+  ws.send(control);
+  ws.send(payload, { binary: true });
+  return true;
+}
+
+function canSend(ws: WebSocket, additionalBytes: number): boolean {
+  if (ws.readyState !== ws.OPEN) {
+    return false;
+  }
+  if (ws.bufferedAmount + additionalBytes <= maxViewerBufferedBytes) {
+    return true;
+  }
+  ws.close(1013, 'Client is not consuming point-cloud updates quickly enough');
+  return false;
 }
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown error';
+}
+
+function failFastOnStorageError(
+  ws: WebSocket,
+  error: DurableBatchError | StorageOperationError,
+): void {
+  console.error(error.message, error.cause);
+  if (ws.readyState === ws.OPEN) {
+    ws.close(1011, 'Durable storage failure; reconnect after the server restarts');
+  }
+  // Continuing would retain an uncommitted batch in memory and could bias a retry.
+  setImmediate(() => process.exit(1));
+}
+
+function runStorageOperation(description: string, operation: () => void): void {
+  try {
+    operation();
+  } catch (error) {
+    throw new StorageOperationError(`Failed to ${description}`, { cause: error });
+  }
 }
 
 function normalizeRawData(data: RawData): Buffer {
@@ -624,18 +755,38 @@ function normalizeRawData(data: RawData): Buffer {
 
 function parseIntegerEnv(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function parseFloatEnv(value: string | undefined, fallback: number): number {
   const parsed = Number.parseFloat(value ?? '');
-  return Number.isFinite(parsed) ? parsed : fallback;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
   console.log(`Received ${signal}, flushing dirty chunks`);
+  clearInterval(liveRefreshTimer);
+  const httpClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+  for (const ws of [...ingestWss.clients, ...viewerWss.clients]) {
+    ws.close(1001, 'Server shutting down');
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  for (const ws of [...ingestWss.clients, ...viewerWss.clients]) {
+    if (ws.readyState !== ws.CLOSED) {
+      ws.terminate();
+    }
+  }
   chunkStore.flushAll();
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await httpClosed;
+  await Promise.all([
+    new Promise<void>((resolve) => ingestWss.close(() => resolve())),
+    new Promise<void>((resolve) => viewerWss.close(() => resolve())),
+  ]);
+  chunkStore.close();
   process.exit(0);
 }
 
@@ -647,8 +798,27 @@ process.on('SIGTERM', () => {
   void shutdown('SIGTERM');
 });
 
-setInterval(refreshLiveBases, liveRefreshMs);
+const liveRefreshTimer = setInterval(refreshLiveBases, liveRefreshMs);
 
 server.listen(port, () => {
   console.log(`point-cloud-visualizer listening on http://localhost:${port}`);
 });
+
+function requireUnboundPublisher(state: ConnectionState): void {
+  if (state.sessionId || state.publisherId) {
+    throw new Error('This ingest connection is already bound to a session');
+  }
+}
+
+function requireBoundPublisher(
+  state: ConnectionState,
+  sessionId: string,
+  publisherId: string,
+): void {
+  if (!state.sessionId || !state.publisherId) {
+    throw new Error('Create or resume a session before publishing data');
+  }
+  if (state.sessionId !== sessionId || state.publisherId !== publisherId) {
+    throw new Error('Message session or publisher does not match this ingest connection');
+  }
+}

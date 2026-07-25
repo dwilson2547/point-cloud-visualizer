@@ -413,3 +413,177 @@ test('listSessionChunkKeys unions resident and persisted cells', () => {
     ['0_0_0', '3_0_0', '6_0_0'],
   );
 });
+
+test('recovers a staged batch after session sequence commit without reapplying it', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-transaction-'));
+  let injectCrash = false;
+  const sessionStore = new SessionStore();
+  const chunkStore = new ChunkStore({
+    rootDir,
+    chunkSizeMeters: 1,
+    fuseVoxelMeters: 0.04,
+    durableBatchHook: (phase) => {
+      if (injectCrash && phase === 'session-synced') {
+        throw new Error('simulated crash');
+      }
+    },
+  });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'transaction-session',
+    publisher_id: 'transaction-publisher',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+
+  const storeBatch = (poseSequence: number, batchSequence: number, xs: number[]): void => {
+    sessionStore.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: session.sessionId,
+      publisher_id: session.publisherId,
+      sequence: poseSequence,
+      timestamp: `2026-07-10T00:00:0${poseSequence}Z`,
+      pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    chunkStore.syncSession(session);
+    const payload = Buffer.alloc(xs.length * POINT_STRIDE_BYTES);
+    xs.forEach((x, index) => payload.writeFloatLE(x, index * POINT_STRIDE_BYTES));
+    const accepted = sessionStore.preparePointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: session.sessionId,
+        publisher_id: session.publisherId,
+        sequence: batchSequence,
+        timestamp: `2026-07-10T00:00:0${batchSequence}Z`,
+        pose_sequence: poseSequence,
+        point_count: xs.length,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    chunkStore.storeAcceptedBatchDurably(accepted, {
+      ...session,
+      pointBatches: session.pointBatches + 1,
+      totalPoints: session.totalPoints + xs.length,
+      lastSequence: batchSequence,
+      lastSeenAt: accepted.header.timestamp,
+    });
+    sessionStore.commitPointBatch(accepted);
+  };
+
+  storeBatch(1, 2, [0, 0.03]);
+  injectCrash = true;
+  assert.throws(() => storeBatch(3, 4, [0.03]), /durably commit batch 4/);
+  chunkStore.close();
+
+  const recovered = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04 });
+  const [restoredSession] = recovered.loadSessions();
+  assert.equal(restoredSession.lastSequence, 4);
+  assert.equal(restoredSession.totalPoints, 3);
+  const [world] = recovered.readSessionWorldChunks(session.sessionId);
+  assert.ok(Math.abs(world.readFloatLE(0) - 0.02) < 1e-6);
+
+  const restoredStore = new SessionStore();
+  restoredStore.restoreSessions(recovered.loadSessions());
+  const restoredRecord = restoredStore.resumeSession({
+    type: 'resume_session',
+    protocol_version: 1,
+    session_id: session.sessionId,
+    publisher_id: session.publisherId,
+    last_client_sequence: 4,
+  });
+  restoredStore.applyPoseUpdate({
+    type: 'pose_update',
+    session_id: session.sessionId,
+    publisher_id: session.publisherId,
+    sequence: 5,
+    timestamp: '2026-07-10T00:00:05Z',
+    pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+  });
+  recovered.syncSession(restoredRecord);
+  const payload = Buffer.alloc(POINT_STRIDE_BYTES);
+  payload.writeFloatLE(0.03, 0);
+  const accepted = restoredStore.preparePointBatch(
+    {
+      type: 'point_batch_header',
+      session_id: session.sessionId,
+      publisher_id: session.publisherId,
+      sequence: 6,
+      timestamp: '2026-07-10T00:00:06Z',
+      pose_sequence: 5,
+      point_count: 1,
+      point_format: POINT_FORMAT,
+      encoding: 'binary_le',
+      compression: 'none',
+      stride_bytes: POINT_STRIDE_BYTES,
+    },
+    payload,
+  );
+  recovered.storeAcceptedBatchDurably(accepted, {
+    ...restoredRecord,
+    pointBatches: restoredRecord.pointBatches + 1,
+    totalPoints: restoredRecord.totalPoints + 1,
+    lastSequence: 6,
+    lastSeenAt: accepted.header.timestamp,
+  });
+  restoredStore.commitPointBatch(accepted);
+  const [afterRestart] = recovered.readSessionWorldChunks(session.sessionId);
+  assert.ok(Math.abs(afterRestart.readFloatLE(0) - 0.0225) < 1e-6);
+  recovered.close();
+});
+
+test('rejects excessive chunk fan-out before mutating the store', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-chunk-limit-'));
+  const sessionStore = new SessionStore();
+  const chunkStore = new ChunkStore({
+    rootDir,
+    chunkSizeMeters: 1,
+    maxChunksPerBatch: 1,
+  });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'chunk-limit-session',
+    publisher_id: 'chunk-limit-publisher',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  sessionStore.applyPoseUpdate({
+    type: 'pose_update',
+    session_id: session.sessionId,
+    publisher_id: session.publisherId,
+    sequence: 1,
+    timestamp: '2026-07-10T00:00:01Z',
+    pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+  });
+  const payload = Buffer.alloc(2 * POINT_STRIDE_BYTES);
+  payload.writeFloatLE(0.5, 0);
+  payload.writeFloatLE(2.5, POINT_STRIDE_BYTES);
+  const accepted = sessionStore.preparePointBatch(
+    {
+      type: 'point_batch_header',
+      session_id: session.sessionId,
+      publisher_id: session.publisherId,
+      sequence: 2,
+      timestamp: '2026-07-10T00:00:02Z',
+      pose_sequence: 1,
+      point_count: 2,
+      point_format: POINT_FORMAT,
+      encoding: 'binary_le',
+      compression: 'none',
+      stride_bytes: POINT_STRIDE_BYTES,
+    },
+    payload,
+  );
+
+  assert.throws(() => chunkStore.storeAcceptedBatch(accepted), /configured 1 chunk limit/);
+  assert.equal(chunkStore.readSessionWorldChunks(session.sessionId).length, 0);
+  chunkStore.close();
+});

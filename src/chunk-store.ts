@@ -4,8 +4,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 import {
   type AcceptedBatch,
+  type SessionSnapshot,
 } from './session-store.js';
 import { POINT_STRIDE_BYTES } from './protocol.js';
+
+const ACCUMULATOR_STRIDE_BYTES = 64;
 
 export interface ChunkStoreOptions {
   rootDir: string;
@@ -14,6 +17,8 @@ export interface ChunkStoreOptions {
   numLevels?: number;
   flushPointThreshold?: number;
   maxDirtyChunks?: number;
+  maxChunksPerBatch?: number;
+  durableBatchHook?: (phase: 'staged' | 'session-synced') => void;
 }
 
 export interface ChunkMetadata {
@@ -41,10 +46,18 @@ export interface StorageSummary {
   numLevels: number;
   flushPointThreshold: number;
   maxDirtyChunks: number;
+  maxChunksPerBatch: number;
   activeChunks: number;
   persistedSessions: number;
   persistedChunks: number;
   persistedBytes: number;
+}
+
+export class DurableBatchError extends Error {
+  constructor(message: string, options: ErrorOptions) {
+    super(message, options);
+    this.name = 'DurableBatchError';
+  }
 }
 
 // One occupied voxel's running fusion state: component sums plus a count, so the
@@ -72,12 +85,14 @@ interface ActiveChunk {
   chunkY: number;
   chunkZ: number;
   filePath: string;
+  accumulatorPath: string;
   voxels: Map<string, VoxelAccumulator>;
   pointsSinceFlush: number;
 }
 
 interface SerializedVoxels {
   buffer: Buffer;
+  accumulatorBuffer: Buffer;
   minX: number;
   minY: number;
   minZ: number;
@@ -86,19 +101,31 @@ interface SerializedVoxels {
   maxZ: number;
 }
 
-interface SessionSnapshot {
+interface StagedChunk {
+  chunkKey: string;
+  chunkX: number;
+  chunkY: number;
+  chunkZ: number;
+  stagedFile: string;
+  finalFile: string;
+  stagedAccumulatorFile: string;
+  finalAccumulatorFile: string;
+  pointCount: number;
+  batchCount: number;
+  bytes: number;
+  minX: number;
+  minY: number;
+  minZ: number;
+  maxX: number;
+  maxY: number;
+  maxZ: number;
+  updatedAt: string;
+}
+
+interface BatchTransactionManifest {
   sessionId: string;
-  publisherId: string;
-  startedAt: string;
-  lastSeenAt: string;
-  frameId: string;
-  units: string;
-  metadata?: unknown;
-  closed: boolean;
-  totalPoints: number;
-  pointBatches: number;
-  lastSequence: number;
-  lastPoseSequence: number | null;
+  sequence: number;
+  chunks: StagedChunk[];
 }
 
 export class ChunkStore {
@@ -107,10 +134,13 @@ export class ChunkStore {
   readonly numLevels: number;
   readonly flushPointThreshold: number;
   readonly maxDirtyChunks: number;
+  readonly maxChunksPerBatch: number;
 
   private readonly rootDir: string;
   private readonly chunksDir: string;
+  private readonly transactionsDir: string;
   private readonly database: DatabaseSync;
+  private readonly durableBatchHook?: (phase: 'staged' | 'session-synced') => void;
   // Chunks currently resident in memory, keyed `sessionId:chunkKey`. Insertion
   // order is the LRU order used for eviction.
   private readonly activeChunks = new Map<string, ActiveChunk>();
@@ -118,15 +148,20 @@ export class ChunkStore {
   constructor(options: ChunkStoreOptions) {
     this.rootDir = options.rootDir;
     this.chunksDir = path.join(this.rootDir, 'chunks');
+    this.transactionsDir = path.join(this.rootDir, 'transactions');
     this.chunkSizeMeters = options.chunkSizeMeters ?? 2;
     this.fuseVoxelMeters = options.fuseVoxelMeters ?? 0.04;
     this.numLevels = Math.max(1, options.numLevels ?? 6);
     this.flushPointThreshold = options.flushPointThreshold ?? 50_000;
     this.maxDirtyChunks = options.maxDirtyChunks ?? 128;
+    this.maxChunksPerBatch = options.maxChunksPerBatch ?? 128;
+    this.durableBatchHook = options.durableBatchHook;
 
     fs.mkdirSync(this.chunksDir, { recursive: true });
+    fs.mkdirSync(this.transactionsDir, { recursive: true });
     this.database = new DatabaseSync(path.join(this.rootDir, 'metadata.sqlite'));
     this.initializeSchema();
+    this.recoverBatchTransactions();
   }
 
   syncSession(session: SessionSnapshot): void {
@@ -165,11 +200,78 @@ export class ChunkStore {
       );
   }
 
+  loadSessions(): SessionSnapshot[] {
+    return this.database
+      .prepare(
+        `SELECT
+          session_id, publisher_id, started_at, last_seen_at, frame_id, units, metadata_json,
+          closed, total_points, point_batches, last_sequence, last_pose_sequence
+        FROM sessions
+        ORDER BY started_at`,
+      )
+      .all()
+      .map((row) => ({
+        sessionId: String(row.session_id),
+        publisherId: String(row.publisher_id),
+        startedAt: String(row.started_at),
+        lastSeenAt: String(row.last_seen_at),
+        frameId: String(row.frame_id),
+        units: String(row.units),
+        metadata: row.metadata_json ? JSON.parse(String(row.metadata_json)) : undefined,
+        closed: Number(row.closed) !== 0,
+        totalPoints: Number(row.total_points),
+        pointBatches: Number(row.point_batches),
+        lastSequence: Number(row.last_sequence),
+        lastPoseSequence:
+          row.last_pose_sequence === null ? null : Number(row.last_pose_sequence),
+      }));
+  }
+
   // Transform a batch's local-frame points into the world frame and fuse them into
   // per-chunk voxel grids. Density is bounded by occupied voxels, not by measurement
   // count, so re-observing a surface adds no points once its voxels are filled. Returns
   // the chunk keys this batch touched, so callers can refresh those chunks for viewers.
   storeAcceptedBatch(accepted: AcceptedBatch): string[] {
+    this.collectBatchChunkKeys(accepted);
+    return this.fuseAcceptedBatch(accepted, true);
+  }
+
+  storeAcceptedBatchDurably(accepted: AcceptedBatch, nextSession: SessionSnapshot): string[] {
+    const batchChunkKeys = this.collectBatchChunkKeys(accepted);
+    if (batchChunkKeys.size > this.maxDirtyChunks) {
+      throw new Error(
+        `Batch touches ${batchChunkKeys.size} chunks but the resident chunk budget is ${this.maxDirtyChunks}`,
+      );
+    }
+    this.prepareActiveCapacity(accepted.session.sessionId, batchChunkKeys);
+    try {
+      const touchedKeys = this.fuseAcceptedBatch(accepted, false);
+      const manifest = this.stageBatchTransaction(
+        accepted.session.sessionId,
+        accepted.header.sequence,
+        touchedKeys,
+      );
+      this.durableBatchHook?.('staged');
+      this.syncSession(nextSession);
+      this.durableBatchHook?.('session-synced');
+      this.finalizeBatchTransaction(manifest);
+      for (const chunkKey of touchedKeys) {
+        const active = this.activeChunks.get(`${accepted.session.sessionId}:${chunkKey}`);
+        if (active) {
+          active.pointsSinceFlush = 0;
+        }
+      }
+      this.enforceActiveLimit();
+      return touchedKeys;
+    } catch (error) {
+      throw new DurableBatchError(
+        `Failed to durably commit batch ${accepted.header.sequence} for ${accepted.session.sessionId}`,
+        { cause: error },
+      );
+    }
+  }
+
+  private fuseAcceptedBatch(accepted: AcceptedBatch, allowPersistence: boolean): string[] {
     const payload = accepted.payload;
     const sessionId = accepted.session.sessionId;
     const [tx, ty, tz] = accepted.pose.pose.translation_m;
@@ -226,21 +328,14 @@ export class ChunkStore {
       const dirtyKey = `${active.sessionId}:${active.chunkKey}`;
       this.activeChunks.delete(dirtyKey);
       this.activeChunks.set(dirtyKey, active);
-      if (active.pointsSinceFlush >= this.flushPointThreshold) {
+      if (allowPersistence && active.pointsSinceFlush >= this.flushPointThreshold) {
         this.persistChunk(active);
       }
     }
 
-    // Bound resident memory: evict least-recently-used chunks (persist + drop).
-    while (this.activeChunks.size > this.maxDirtyChunks) {
-      const oldestKey = this.activeChunks.keys().next().value;
-      if (!oldestKey) {
-        break;
-      }
-      this.evictChunk(oldestKey);
+    if (allowPersistence) {
+      this.enforceActiveLimit();
     }
-
-    this.syncSession(accepted.session);
 
     const touchedKeys: string[] = [];
     for (const active of touched) {
@@ -264,6 +359,10 @@ export class ChunkStore {
     }
   }
 
+  close(): void {
+    this.database.close();
+  }
+
   getStorageSummary(): StorageSummary {
     const counts = this.database
       .prepare(
@@ -284,6 +383,7 @@ export class ChunkStore {
       numLevels: this.numLevels,
       flushPointThreshold: this.flushPointThreshold,
       maxDirtyChunks: this.maxDirtyChunks,
+      maxChunksPerBatch: this.maxChunksPerBatch,
       activeChunks: this.activeChunks.size,
       persistedSessions: counts.persisted_sessions,
       persistedChunks: counts.persisted_chunks,
@@ -329,7 +429,10 @@ export class ChunkStore {
   // disk — and only non-resident chunks are read from their files, so no voxel is
   // counted twice. Points are already world-frame; no pose transform is needed.
   readSessionWorldChunks(sessionId: string): Buffer[] {
-    const chunks: Buffer[] = [];
+    return [...this.iterateSessionWorldChunks(sessionId)];
+  }
+
+  *iterateSessionWorldChunks(sessionId: string): Generator<Buffer> {
     const emitted = new Set<string>();
     const prefix = `${sessionId}:`;
 
@@ -337,7 +440,7 @@ export class ChunkStore {
       if (!key.startsWith(prefix) || active.voxels.size === 0) {
         continue;
       }
-      chunks.push(this.serializeVoxels(active.voxels).buffer);
+      yield this.serializeVoxels(active.voxels).buffer;
       emitted.add(active.chunkKey);
     }
 
@@ -348,14 +451,15 @@ export class ChunkStore {
       try {
         const data = fs.readFileSync(path.join(this.rootDir, chunk.filePath));
         if (data.byteLength > 0) {
-          chunks.push(data);
+          yield data;
         }
-      } catch {
-        // Metadata can briefly lead the file on disk; skip an unreadable chunk.
+      } catch (error) {
+        if (!isNotFoundError(error)) {
+          throw error;
+        }
       }
     }
 
-    return chunks;
   }
 
   // All chunk cells for a session (resident + persisted, deduped). Chunk metadata only
@@ -424,8 +528,11 @@ export class ChunkStore {
     }
     try {
       return fs.readFileSync(path.join(this.chunksDir, sessionId, `${chunkKey}.bin`));
-    } catch {
-      return null;
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return null;
+      }
+      throw error;
     }
   }
 
@@ -468,6 +575,204 @@ export class ChunkStore {
     `);
   }
 
+  private collectBatchChunkKeys(accepted: AcceptedBatch): Set<string> {
+    const [tx, ty, tz] = accepted.pose.pose.translation_m;
+    const [qx, qy, qz, qw] = accepted.pose.pose.rotation_xyzw;
+    const chunks = new Set<string>();
+    for (let offset = 0; offset < accepted.payload.byteLength; offset += POINT_STRIDE_BYTES) {
+      const [worldX, worldY, worldZ] = rotateAndTranslate(
+        accepted.payload.readFloatLE(offset),
+        accepted.payload.readFloatLE(offset + 4),
+        accepted.payload.readFloatLE(offset + 8),
+        qx,
+        qy,
+        qz,
+        qw,
+        tx,
+        ty,
+        tz,
+      );
+      chunks.add(
+        encodeChunkKey(
+          Math.floor(worldX / this.chunkSizeMeters),
+          Math.floor(worldY / this.chunkSizeMeters),
+          Math.floor(worldZ / this.chunkSizeMeters),
+        ),
+      );
+      if (chunks.size > this.maxChunksPerBatch) {
+        throw new Error(
+          `Batch touches more than the configured ${this.maxChunksPerBatch} chunk limit`,
+        );
+      }
+    }
+    return chunks;
+  }
+
+  private prepareActiveCapacity(sessionId: string, batchChunkKeys: Set<string>): void {
+    let newChunkCount = 0;
+    for (const chunkKey of batchChunkKeys) {
+      if (!this.activeChunks.has(`${sessionId}:${chunkKey}`)) {
+        newChunkCount += 1;
+      }
+    }
+    while (this.activeChunks.size + newChunkCount > this.maxDirtyChunks) {
+      const candidate = [...this.activeChunks.keys()].find((key) => {
+        const separator = key.indexOf(':');
+        const activeSessionId = key.slice(0, separator);
+        const chunkKey = key.slice(separator + 1);
+        return activeSessionId !== sessionId || !batchChunkKeys.has(chunkKey);
+      });
+      if (!candidate) {
+        throw new Error('Unable to free enough resident chunk capacity for batch');
+      }
+      this.evictChunk(candidate);
+    }
+  }
+
+  private stageBatchTransaction(
+    sessionId: string,
+    sequence: number,
+    touchedKeys: string[],
+  ): BatchTransactionManifest {
+    const transactionDir = path.join(this.transactionsDir, sessionId, String(sequence));
+    fs.mkdirSync(transactionDir, { recursive: true });
+    const chunks: StagedChunk[] = [];
+
+    for (const chunkKey of touchedKeys) {
+      const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
+      if (!active || active.voxels.size === 0) {
+        continue;
+      }
+      const serialized = this.serializeVoxels(active.voxels);
+      const stagedPath = path.join(transactionDir, `${chunkKey}.bin`);
+      const stagedAccumulatorPath = path.join(transactionDir, `${chunkKey}.acc`);
+      writeFileAtomically(stagedPath, serialized.buffer);
+      writeFileAtomically(stagedAccumulatorPath, serialized.accumulatorBuffer);
+      const previous = this.database
+        .prepare('SELECT batch_count FROM chunks WHERE session_id = ? AND chunk_key = ?')
+        .get(sessionId, chunkKey) as { batch_count?: number } | undefined;
+      chunks.push({
+        chunkKey,
+        chunkX: active.chunkX,
+        chunkY: active.chunkY,
+        chunkZ: active.chunkZ,
+        stagedFile: path.relative(this.rootDir, stagedPath),
+        finalFile: path.relative(this.rootDir, active.filePath),
+        stagedAccumulatorFile: path.relative(this.rootDir, stagedAccumulatorPath),
+        finalAccumulatorFile: path.relative(this.rootDir, active.accumulatorPath),
+        pointCount: active.voxels.size,
+        batchCount: Number(previous?.batch_count ?? 0) + 1,
+        bytes: serialized.buffer.byteLength,
+        minX: serialized.minX,
+        minY: serialized.minY,
+        minZ: serialized.minZ,
+        maxX: serialized.maxX,
+        maxY: serialized.maxY,
+        maxZ: serialized.maxZ,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    const manifest: BatchTransactionManifest = { sessionId, sequence, chunks };
+    writeFileAtomically(
+      path.join(transactionDir, 'manifest.json'),
+      Buffer.from(JSON.stringify(manifest)),
+    );
+    return manifest;
+  }
+
+  private recoverBatchTransactions(): void {
+    for (const sessionEntry of readDirectories(this.transactionsDir)) {
+      const sessionDir = path.join(this.transactionsDir, sessionEntry);
+      const sequenceEntries = readDirectories(sessionDir).sort((a, b) => Number(a) - Number(b));
+      for (const sequenceEntry of sequenceEntries) {
+        const transactionDir = path.join(sessionDir, sequenceEntry);
+        const manifestPath = path.join(transactionDir, 'manifest.json');
+        let manifest: BatchTransactionManifest;
+        try {
+          manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as BatchTransactionManifest;
+        } catch (error) {
+          if (isNotFoundError(error)) {
+            fs.rmSync(transactionDir, { recursive: true, force: true });
+            continue;
+          }
+          throw error;
+        }
+        const persisted = this.database
+          .prepare('SELECT last_sequence FROM sessions WHERE session_id = ?')
+          .get(manifest.sessionId) as { last_sequence?: number } | undefined;
+        if (Number(persisted?.last_sequence ?? -1) >= manifest.sequence) {
+          this.finalizeBatchTransaction(manifest);
+        } else {
+          fs.rmSync(transactionDir, { recursive: true, force: true });
+        }
+      }
+      removeDirectoryIfEmpty(sessionDir);
+    }
+  }
+
+  private finalizeBatchTransaction(manifest: BatchTransactionManifest): void {
+    for (const chunk of manifest.chunks) {
+      const stagedPath = path.join(this.rootDir, chunk.stagedFile);
+      const finalPath = path.join(this.rootDir, chunk.finalFile);
+      const stagedAccumulatorPath = path.join(this.rootDir, chunk.stagedAccumulatorFile);
+      const finalAccumulatorPath = path.join(this.rootDir, chunk.finalAccumulatorFile);
+      fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+      finalizeStagedFile(stagedAccumulatorPath, finalAccumulatorPath, chunk.chunkKey);
+      finalizeStagedFile(stagedPath, finalPath, chunk.chunkKey);
+      this.upsertChunkMetadata(manifest.sessionId, chunk);
+    }
+
+    const transactionDir = path.join(
+      this.transactionsDir,
+      manifest.sessionId,
+      String(manifest.sequence),
+    );
+    fs.rmSync(transactionDir, { recursive: true, force: true });
+    removeDirectoryIfEmpty(path.dirname(transactionDir));
+  }
+
+  private upsertChunkMetadata(sessionId: string, chunk: StagedChunk): void {
+    this.database
+      .prepare(
+        `INSERT INTO chunks (
+          session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
+          point_count, batch_count, bytes,
+          min_x, min_y, min_z, max_x, max_y, max_z, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, chunk_key) DO UPDATE SET
+          file_path = excluded.file_path,
+          point_count = excluded.point_count,
+          batch_count = excluded.batch_count,
+          bytes = excluded.bytes,
+          min_x = excluded.min_x,
+          min_y = excluded.min_y,
+          min_z = excluded.min_z,
+          max_x = excluded.max_x,
+          max_y = excluded.max_y,
+          max_z = excluded.max_z,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        sessionId,
+        chunk.chunkKey,
+        chunk.chunkX,
+        chunk.chunkY,
+        chunk.chunkZ,
+        chunk.finalFile,
+        chunk.pointCount,
+        chunk.batchCount,
+        chunk.bytes,
+        chunk.minX,
+        chunk.minY,
+        chunk.minZ,
+        chunk.maxX,
+        chunk.maxY,
+        chunk.maxZ,
+        chunk.updatedAt,
+      );
+  }
+
   // Return the resident chunk for a cell, creating it (and seeding it from any
   // existing file so fusion continues from prior state) on first touch.
   private activateChunk(
@@ -490,6 +795,7 @@ export class ChunkStore {
       chunkY,
       chunkZ,
       filePath: path.join(this.chunksDir, sessionId, `${chunkKey}.bin`),
+      accumulatorPath: path.join(this.chunksDir, sessionId, `${chunkKey}.acc`),
       voxels: new Map(),
       pointsSinceFlush: 0,
     };
@@ -501,11 +807,17 @@ export class ChunkStore {
   // Load a previously-flushed chunk file back into voxel accumulators. The file is
   // already one representative per voxel, so each seeds a fresh accumulator at n=1.
   private seedFromDisk(active: ActiveChunk): void {
+    if (this.seedAccumulatorsFromDisk(active)) {
+      return;
+    }
     let data: Buffer;
     try {
       data = fs.readFileSync(active.filePath);
-    } catch {
-      return; // resting chunk with no file yet, or unreadable — start empty
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return;
+      }
+      throw error;
     }
     for (let o = 0; o + POINT_STRIDE_BYTES <= data.byteLength; o += POINT_STRIDE_BYTES) {
       const worldX = data.readFloatLE(o);
@@ -524,6 +836,41 @@ export class ChunkStore {
     }
   }
 
+  private seedAccumulatorsFromDisk(active: ActiveChunk): boolean {
+    let data: Buffer;
+    try {
+      data = fs.readFileSync(active.accumulatorPath);
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return false;
+      }
+      throw error;
+    }
+    if (data.byteLength % ACCUMULATOR_STRIDE_BYTES !== 0) {
+      throw new Error(`Invalid accumulator file length for ${active.chunkKey}`);
+    }
+    for (let offset = 0; offset < data.byteLength; offset += ACCUMULATOR_STRIDE_BYTES) {
+      const acc: VoxelAccumulator = {
+        sx: data.readDoubleLE(offset),
+        sy: data.readDoubleLE(offset + 8),
+        sz: data.readDoubleLE(offset + 16),
+        sr: data.readDoubleLE(offset + 24),
+        sg: data.readDoubleLE(offset + 32),
+        sb: data.readDoubleLE(offset + 40),
+        si: data.readDoubleLE(offset + 48),
+        n: data.readDoubleLE(offset + 56),
+      };
+      if (acc.n === 0) {
+        throw new Error(`Accumulator with zero samples in ${active.chunkKey}`);
+      }
+      active.voxels.set(
+        voxelKey(acc.sx / acc.n, acc.sy / acc.n, acc.sz / acc.n, this.fuseVoxelMeters),
+        acc,
+      );
+    }
+    return true;
+  }
+
   // Overwrite a chunk's file with its current voxel representatives and upsert its
   // metadata. The chunk stays resident so fusion continues in place.
   private persistChunk(active: ActiveChunk): void {
@@ -534,7 +881,8 @@ export class ChunkStore {
 
     const serialized = this.serializeVoxels(active.voxels);
     fs.mkdirSync(path.dirname(active.filePath), { recursive: true });
-    fs.writeFileSync(active.filePath, serialized.buffer);
+    writeFileAtomically(active.accumulatorPath, serialized.accumulatorBuffer);
+    writeFileAtomically(active.filePath, serialized.buffer);
 
     const now = new Date().toISOString();
     this.database
@@ -577,12 +925,24 @@ export class ChunkStore {
       );
   }
 
+  private enforceActiveLimit(): void {
+    while (this.activeChunks.size > this.maxDirtyChunks) {
+      const oldestKey = this.activeChunks.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      this.evictChunk(oldestKey);
+    }
+  }
+
   private evictChunk(dirtyKey: string): void {
     const active = this.activeChunks.get(dirtyKey);
     if (!active) {
       return;
     }
-    this.persistChunk(active);
+    if (active.pointsSinceFlush > 0 || !fs.existsSync(active.filePath)) {
+      this.persistChunk(active);
+    }
     this.activeChunks.delete(dirtyKey);
   }
 
@@ -590,6 +950,7 @@ export class ChunkStore {
   // per voxel, the component mean) and compute its world-frame bounds in one pass.
   private serializeVoxels(voxels: Map<string, VoxelAccumulator>): SerializedVoxels {
     const buffer = Buffer.allocUnsafe(voxels.size * POINT_STRIDE_BYTES);
+    const accumulatorBuffer = Buffer.allocUnsafe(voxels.size * ACCUMULATOR_STRIDE_BYTES);
     let minX = Number.POSITIVE_INFINITY;
     let minY = Number.POSITIVE_INFINITY;
     let minZ = Number.POSITIVE_INFINITY;
@@ -610,6 +971,15 @@ export class ChunkStore {
       buffer[offset + 14] = clampU8(Math.round(acc.sb / acc.n));
       buffer.writeUInt16LE(clampU16(Math.round(acc.si / acc.n)), offset + 15);
       buffer[offset + 17] = 0;
+      const accumulatorOffset = (offset / POINT_STRIDE_BYTES) * ACCUMULATOR_STRIDE_BYTES;
+      accumulatorBuffer.writeDoubleLE(acc.sx, accumulatorOffset);
+      accumulatorBuffer.writeDoubleLE(acc.sy, accumulatorOffset + 8);
+      accumulatorBuffer.writeDoubleLE(acc.sz, accumulatorOffset + 16);
+      accumulatorBuffer.writeDoubleLE(acc.sr, accumulatorOffset + 24);
+      accumulatorBuffer.writeDoubleLE(acc.sg, accumulatorOffset + 32);
+      accumulatorBuffer.writeDoubleLE(acc.sb, accumulatorOffset + 40);
+      accumulatorBuffer.writeDoubleLE(acc.si, accumulatorOffset + 48);
+      accumulatorBuffer.writeDoubleLE(acc.n, accumulatorOffset + 56);
 
       if (x < minX) minX = x;
       if (y < minY) minY = y;
@@ -621,7 +991,7 @@ export class ChunkStore {
       offset += POINT_STRIDE_BYTES;
     }
 
-    return { buffer, minX, minY, minZ, maxX, maxY, maxZ };
+    return { buffer, accumulatorBuffer, minX, minY, minZ, maxX, maxY, maxZ };
   }
 }
 
@@ -666,6 +1036,87 @@ function clampU8(value: number): number {
 
 function clampU16(value: number): number {
   return value < 0 ? 0 : value > 65535 ? 65535 : value;
+}
+
+function writeFileAtomically(filePath: string, data: Buffer): void {
+  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(temporaryPath, 'wx');
+    fs.writeFileSync(descriptor, data);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporaryPath, filePath);
+    syncDirectory(path.dirname(filePath));
+  } catch (error) {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch (cleanupError) {
+      if (!isNotFoundError(cleanupError)) {
+        throw cleanupError;
+      }
+    }
+    throw error;
+  }
+}
+
+function finalizeStagedFile(stagedPath: string, finalPath: string, chunkKey: string): void {
+  if (fs.existsSync(stagedPath)) {
+    fs.renameSync(stagedPath, finalPath);
+    syncDirectory(path.dirname(finalPath));
+    return;
+  }
+  if (!fs.existsSync(finalPath)) {
+    throw new Error(`Missing staged and final chunk file for ${chunkKey}`);
+  }
+}
+
+function syncDirectory(directoryPath: string): void {
+  const descriptor = fs.openSync(directoryPath, 'r');
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function readDirectories(directoryPath: string): string[] {
+  try {
+    return fs
+      .readdirSync(directoryPath, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+function removeDirectoryIfEmpty(directoryPath: string): void {
+  try {
+    if (fs.readdirSync(directoryPath).length === 0) {
+      fs.rmdirSync(directoryPath);
+    }
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'ENOENT'
+  );
 }
 
 function rotateAndTranslate(
