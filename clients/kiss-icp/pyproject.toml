@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcv-kiss-icp-client"
+version = "0.1.0"
+description = "Standalone VLP-16 KISS-ICP publisher for point-cloud-visualizer"
+requires-python = ">=3.10"
+dependencies = [
+  "kiss-icp>=1.3,<2",
+  "numpy>=1.26",
+  "websockets>=14,<17",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+pcv-vlp16-kiss = "pcv_kiss_icp.publisher:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pcv_kiss_icp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

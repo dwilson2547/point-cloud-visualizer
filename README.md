@@ -42,6 +42,8 @@ Direct sensor-to-server ingestion can remain a stretch goal.
 - [`docs/architecture.md`](docs/architecture.md) — initial backend and viewer architecture
 - [`docs/protocol-v1.md`](docs/protocol-v1.md) — draft WebSocket ingest protocol for v1
 - [`docs/vlp16-client.md`](docs/vlp16-client.md) — recommended Velodyne VLP-16 publisher setup
+- [`docs/vlp16-kiss-icp.md`](docs/vlp16-kiss-icp.md) — IMU-free moving VLP-16 trial with KISS-ICP
+- [`docs/vlp16-moving-odometry.md`](docs/vlp16-moving-odometry.md) — ESP32/BMI088 + Point-LIO design
 - [`docs/vlp32-client.md`](docs/vlp32-client.md) — first-pass Velodyne VLP-32 publisher setup
 - [`docs/notes/README.md`](docs/notes/README.md) — atomic project notes index
 
@@ -117,6 +119,9 @@ sensor later.
 
 See [`docs/vlp16-client.md`](docs/vlp16-client.md) for the preferred starting setup and required
 calibration JSON shape.
+
+For moving tests before the external IMU is ready, use the standalone
+[KISS-ICP publisher](docs/vlp16-kiss-icp.md).
 
 ## Runtime scripts
 

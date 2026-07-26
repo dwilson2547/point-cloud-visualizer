@@ -1,0 +1,20 @@
+{
+  "lasers": [
+    { "laserId": 0,  "verticalDegrees": -15.0 },
+    { "laserId": 1,  "verticalDegrees": 1.0 },
+    { "laserId": 2,  "verticalDegrees": -13.0 },
+    { "laserId": 3,  "verticalDegrees": 3.0 },
+    { "laserId": 4,  "verticalDegrees": -11.0 },
+    { "laserId": 5,  "verticalDegrees": 5.0 },
+    { "laserId": 6,  "verticalDegrees": -9.0 },
+    { "laserId": 7,  "verticalDegrees": 7.0 },
+    { "laserId": 8,  "verticalDegrees": -7.0 },
+    { "laserId": 9,  "verticalDegrees": 9.0 },
+    { "laserId": 10, "verticalDegrees": -5.0 },
+    { "laserId": 11, "verticalDegrees": 11.0 },
+    { "laserId": 12, "verticalDegrees": -3.0 },
+    { "laserId": 13, "verticalDegrees": 13.0 },
+    { "laserId": 14, "verticalDegrees": -1.0 },
+    { "laserId": 15, "verticalDegrees": 15.0 }
+  ]
+}

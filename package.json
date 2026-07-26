@@ -10,7 +10,7 @@
     "client:vlp32": "tsx src/vlp32-client.ts",
     "client:synthetic": "tsx src/synthetic-publisher.ts",
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "test": "tsx --test test/**/*.test.ts"
   },
   "engines": {

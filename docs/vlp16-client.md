@@ -15,6 +15,9 @@ first-pass UDP client that listens for VLP-16 packets on the host, converts them
 
 This is the right shape for a **stationary lidar** or an initial bench setup. If you later want a
 moving rig, the next step is to replace the identity pose with odometry from another source.
+The selected moving-rig direction is documented in
+[`vlp16-moving-odometry.md`](./vlp16-moving-odometry.md).
+An IMU-free [KISS-ICP publisher](./vlp16-kiss-icp.md) is also available for short-term moving tests.
 
 ## Why VLP-16 first
 
