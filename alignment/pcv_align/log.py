@@ -29,6 +29,38 @@ POINT_DTYPE = np.dtype(
     ],
     align=False,
 )
+# xyzi_q4_v2: int16 xyz at 4 mm + 8-bit intensity (src/point-formats.ts).
+Q4_DTYPE = np.dtype([("x", "<i2"), ("y", "<i2"), ("z", "<i2"), ("intensity", "u1")], align=False)
+Q4_METERS = 0.004
+POINT_FORMAT_V1 = "xyz_rgb_i_v1"
+POINT_FORMAT_Q4 = "xyzi_q4_v2"
+
+
+def decode_points(payload: bytes, point_format: str) -> np.ndarray:
+    """(N, 3) float64 sensor-frame points from a wire payload in either ingest format."""
+    if point_format == POINT_FORMAT_Q4:
+        raw = np.frombuffer(payload, dtype=Q4_DTYPE)
+        return np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float64) * Q4_METERS
+    raw = np.frombuffer(payload, dtype=POINT_DTYPE)
+    return np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float64)
+
+
+def encode_points(points: np.ndarray, point_format: str, intensity: np.ndarray | None = None) -> bytes:
+    """Wire payload for sensor-frame points in either ingest format (publishers)."""
+    pts = np.asarray(points, dtype=np.float64)
+    if intensity is None:
+        intensity = np.full(pts.shape[0], 128, dtype=np.uint8)
+    if point_format == POINT_FORMAT_Q4:
+        wire = np.zeros(pts.shape[0], dtype=Q4_DTYPE)
+        q = np.clip(np.round(pts / Q4_METERS), -32768, 32767).astype(np.int16)
+        wire["x"], wire["y"], wire["z"] = q[:, 0], q[:, 1], q[:, 2]
+        wire["intensity"] = np.asarray(intensity, dtype=np.uint8)
+        return wire.tobytes()
+    wire = np.zeros(pts.shape[0], dtype=POINT_DTYPE)
+    wire["x"], wire["y"], wire["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
+    wire["r"] = wire["g"] = wire["b"] = np.asarray(intensity, dtype=np.uint8)
+    wire["intensity"] = np.asarray(intensity, dtype=np.uint16) << 8
+    return wire.tobytes()
 
 
 @dataclass
@@ -123,8 +155,7 @@ def parse_records(data: bytes) -> tuple[list[Batch], int]:
         if zlib.crc32(body) & 0xFFFFFFFF != crc:
             break
         header = json.loads(body[:header_len])
-        raw = np.frombuffer(body[header_len:], dtype=POINT_DTYPE)
-        points = np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float64)
+        points = decode_points(body[header_len:], str(header.get("point_format", POINT_FORMAT_V1)))
         batches.append(
             Batch(
                 sequence=int(header["sequence"]),

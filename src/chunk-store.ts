@@ -6,7 +6,8 @@ import {
   type AcceptedBatch,
   type SessionSnapshot,
 } from './session-store.js';
-import { POINT_STRIDE_BYTES, type Pose } from './protocol.js';
+import { POINT_FORMAT, POINT_STRIDE_BYTES, type Pose } from './protocol.js';
+import { toInternalPoints } from './point-formats.js';
 import { BatchLogWriter, readLogRecordAt, replayLog, type LogRecord, type LogRecordHeader } from './batch-log.js';
 import {
   PoseCorrectionMap,
@@ -342,10 +343,11 @@ export class ChunkStore {
   // Fuse a batch into the resident chunk cache without logging it. For tests and
   // tooling; the server always goes through storeAcceptedBatchDurably.
   storeAcceptedBatch(accepted: AcceptedBatch): FusedBatch {
-    this.collectBatchChunkKeys(accepted);
+    const internal = toInternalPoints(accepted.payload, accepted.header.point_format ?? POINT_FORMAT);
+    this.chunkKeysForPayload(internal, accepted.pose.pose, this.maxChunksPerBatch);
     const sessionId = accepted.session.sessionId;
     const pose = this.effectivePose(sessionId, accepted.header.pose_sequence, accepted.pose.pose);
-    const { touched } = this.fuseBatch(sessionId, accepted.header.sequence, pose, accepted.payload, true);
+    const { touched } = this.fuseBatch(sessionId, accepted.header.sequence, pose, internal, true);
     return { touchedKeys: touched, pose };
   }
 
@@ -356,7 +358,9 @@ export class ChunkStore {
   // chunk keys the batch touched so callers can refresh them for viewers.
   storeAcceptedBatchDurably(accepted: AcceptedBatch, nextSession: SessionSnapshot): FusedBatch {
     const sessionId = accepted.session.sessionId;
-    const batchChunkKeys = this.collectBatchChunkKeys(accepted);
+    const format = accepted.header.point_format ?? POINT_FORMAT;
+    const internal = toInternalPoints(accepted.payload, format);
+    const batchChunkKeys = this.chunkKeysForPayload(internal, accepted.pose.pose, this.maxChunksPerBatch);
     if (batchChunkKeys.size > this.maxDirtyChunks) {
       throw new Error(
         `Batch touches ${batchChunkKeys.size} chunks but the resident chunk budget is ${this.maxDirtyChunks}`,
@@ -371,14 +375,15 @@ export class ChunkStore {
         timestamp: accepted.header.timestamp,
         point_count: accepted.header.point_count,
         pose: accepted.pose.pose,
+        point_format: format,
       };
       const logOffset = state.endOffset;
-      state.endOffset = writer.append(record, accepted.payload);
+      state.endOffset = writer.append(record, accepted.payload); // as sent, not decoded
       this.durableBatchHook?.('logged');
 
       this.prepareActiveCapacity(sessionId, batchChunkKeys);
       const pose = this.effectivePose(sessionId, accepted.header.pose_sequence, accepted.pose.pose);
-      const { touched, spanned } = this.fuseBatch(sessionId, accepted.header.sequence, pose, accepted.payload, true);
+      const { touched, spanned } = this.fuseBatch(sessionId, accepted.header.sequence, pose, internal, true);
       this.recordFusedBatch(sessionId, record, logOffset, pose, spanned);
       this.syncSession(nextSession);
       this.durableBatchHook?.('fused');
@@ -784,7 +789,7 @@ export class ChunkStore {
       }
       records.set(row.sequence, record);
       const pose = this.effectivePose(sessionId, record.header.pose_sequence, record.header.pose);
-      for (const key of this.chunkKeysForPayload(record.payload, pose)) {
+      for (const key of this.chunkKeysForPayload(internalPoints(record), pose)) {
         affected.add(key);
       }
     }
@@ -863,7 +868,7 @@ export class ChunkStore {
       if (next < replay.length && replay[next].sequence === row.sequence) {
         const entry = replay[next++];
         const record = records.get(entry.sequence) ?? readLogRecordAt(logPath, entry.logOffset);
-        const { spanned } = this.fuseBatch(sessionId, record.header.sequence, pose, record.payload, true, affected);
+        const { spanned } = this.fuseBatch(sessionId, record.header.sequence, pose, internalPoints(record), true, affected);
         if (changedSequences.has(record.header.sequence)) {
           this.recordFusedBatch(sessionId, record.header, record.offset, pose, spanned);
         }
@@ -908,9 +913,9 @@ export class ChunkStore {
     this.database.prepare('UPDATE sessions SET checkpoint_offset = 0 WHERE session_id = ?').run(sessionId);
 
     const result = replayLog(this.sessionLogPath(sessionId), 0, (record) => {
-      const { header, payload } = record;
+      const { header } = record;
       const pose = this.effectivePose(sessionId, header.pose_sequence, header.pose);
-      const { spanned } = this.fuseBatch(sessionId, header.sequence, pose, payload, true);
+      const { spanned } = this.fuseBatch(sessionId, header.sequence, pose, internalPoints(record), true);
       this.recordFusedBatch(sessionId, header, record.offset, pose, spanned);
     });
     state.endOffset = result.endOffset;
@@ -1408,9 +1413,9 @@ export class ChunkStore {
       let lastSeenAt: string | undefined;
 
       const result = replayLog(logPath, state.checkpointOffset, (record) => {
-        const { header, payload } = record;
+        const { header } = record;
         const pose = this.effectivePose(sessionId, header.pose_sequence, header.pose);
-        const { spanned } = this.fuseBatch(sessionId, header.sequence, pose, payload, true);
+        const { spanned } = this.fuseBatch(sessionId, header.sequence, pose, internalPoints(record), true);
         this.recordFusedBatch(sessionId, header, record.offset, pose, spanned);
         if (header.sequence > lastSequence) {
           // Counters in SQLite lag the log (they are only written after the fuse), so
@@ -1449,10 +1454,6 @@ export class ChunkStore {
         this.log(`Batch log for unknown session ${entry} left untouched`);
       }
     }
-  }
-
-  private collectBatchChunkKeys(accepted: AcceptedBatch): Set<string> {
-    return this.chunkKeysForPayload(accepted.payload, accepted.pose.pose, this.maxChunksPerBatch);
   }
 
   // Every chunk a payload's points land in under `pose`; throws past `limit` chunks.
@@ -1881,6 +1882,11 @@ function syncDirectory(directoryPath: string): void {
   } finally {
     fs.closeSync(descriptor);
   }
+}
+
+// A log record's points in the internal layout, whatever format the publisher used.
+function internalPoints(record: LogRecord): Buffer {
+  return toInternalPoints(record.payload, record.header.point_format ?? POINT_FORMAT);
 }
 
 function isFilterActive(filter?: ObservationFilter): boolean {

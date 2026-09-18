@@ -12,7 +12,7 @@ import time
 import numpy as np
 from websockets.sync.client import connect
 
-from .log import POINT_DTYPE, matrix_to_pose
+from .log import POINT_FORMAT_Q4, POINT_FORMAT_V1, Q4_DTYPE, POINT_DTYPE, encode_points, matrix_to_pose
 from .synthetic import Scenario, make_batches
 
 
@@ -24,6 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yaw-bias", type=float, default=Scenario.yaw_bias_deg_per_step)
     parser.add_argument("--scale-error", type=float, default=Scenario.scale_error)
     parser.add_argument("--fliers", type=float, default=0.0, help="fraction of one-off artefact points per batch")
+    parser.add_argument(
+        "--point-format", choices=[POINT_FORMAT_V1, POINT_FORMAT_Q4], default=POINT_FORMAT_Q4,
+        help="wire format for point batches (v1 is 18 B/point with colour, q4 is 7 B/point)",
+    )
     parser.add_argument(
         "--azimuth-steps", type=int, default=Scenario.azimuth_steps,
         help="rays per ring per spin (1800 matches a VLP-16 at 10 Hz; the default 360 is quick)",
@@ -75,13 +79,19 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
             )
-            wire = np.zeros(batch.points.shape[0], dtype=POINT_DTYPE)
-            wire["x"], wire["y"], wire["z"] = batch.points[:, 0], batch.points[:, 1], batch.points[:, 2]
             height = np.clip((batch.points[:, 2] + 1.5) / 3.0, 0.0, 1.0)
-            wire["r"] = (60 + 160 * height).astype(np.uint8)
-            wire["g"] = (120 + 80 * (1 - height)).astype(np.uint8)
-            wire["b"] = (200 - 120 * height).astype(np.uint8)
-            wire["intensity"] = 1000
+            if args.point_format == POINT_FORMAT_V1:
+                wire = np.zeros(batch.points.shape[0], dtype=POINT_DTYPE)
+                wire["x"], wire["y"], wire["z"] = batch.points[:, 0], batch.points[:, 1], batch.points[:, 2]
+                wire["r"] = (60 + 160 * height).astype(np.uint8)
+                wire["g"] = (120 + 80 * (1 - height)).astype(np.uint8)
+                wire["b"] = (200 - 120 * height).astype(np.uint8)
+                wire["intensity"] = 1000
+                payload = wire.tobytes()
+                stride = POINT_DTYPE.itemsize
+            else:
+                payload = encode_points(batch.points, POINT_FORMAT_Q4, (60 + 160 * height).astype(np.uint8))
+                stride = Q4_DTYPE.itemsize
             ws.send(
                 json.dumps(
                     {
@@ -92,14 +102,14 @@ def main(argv: list[str] | None = None) -> int:
                         "timestamp": timestamp,
                         "pose_sequence": batch.pose_sequence,
                         "point_count": int(batch.points.shape[0]),
-                        "point_format": "xyz_rgb_i_v1",
+                        "point_format": args.point_format,
                         "encoding": "binary_le",
                         "compression": "none",
-                        "stride_bytes": 18,
+                        "stride_bytes": stride,
                     }
                 )
             )
-            ws.send(wire.tobytes())
+            ws.send(payload)
             response = json.loads(ws.recv())
             if response.get("type") != "point_batch_ack":
                 print(f"batch rejected: {response}", file=sys.stderr)

@@ -1,12 +1,14 @@
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
 
-// Wire layout of the xyz_rgb_i_v1 point (must match src/protocol.ts POINT_STRIDE_BYTES):
-//   0..11  x,y,z   float32 LE
-//   12..14 r,g,b   uint8
-//   15..16 intensity uint16 LE
-//   17     padding
+// Wire layouts (src/point-formats.ts). The overlay receives whatever the publisher
+// sent (xyz_rgb_i_v1 at 18 B or xyzi_q4_v2 at 7 B, local frame + pose); the base
+// layer is requested as q8_chunk_v2 (7 B, chunk-relative) and falls back to v1.
 const STRIDE = 18;
+const Q4_STRIDE = 7;
+const Q4_METERS = 0.004;
+const Q8_STRIDE = 7;
+const BASE_FORMAT = 'q8_chunk_v2';
 
 // Live-overlay ring capacity. The overlay holds the newest chunk_update points at low
 // latency; the accumulated, LOD'd world lives in the per-chunk base layer instead, so
@@ -85,12 +87,25 @@ function ingestOverlay(header, buffer) {
   const e = m.elements;
   const startSlot = overlayHead;
   let wrapped = false;
+  const q4 = header.point_format === 'xyzi_q4_v2';
 
   for (let i = 0; i < count; i++) {
-    const o = i * STRIDE;
-    const lx = view.getFloat32(o, true);
-    const ly = view.getFloat32(o + 4, true);
-    const lz = view.getFloat32(o + 8, true);
+    let lx, ly, lz, r, g, b;
+    if (q4) {
+      const o = i * Q4_STRIDE;
+      lx = view.getInt16(o, true) * Q4_METERS;
+      ly = view.getInt16(o + 2, true) * Q4_METERS;
+      lz = view.getInt16(o + 4, true) * Q4_METERS;
+      r = g = b = view.getUint8(o + 6);
+    } else {
+      const o = i * STRIDE;
+      lx = view.getFloat32(o, true);
+      ly = view.getFloat32(o + 4, true);
+      lz = view.getFloat32(o + 8, true);
+      r = view.getUint8(o + 12);
+      g = view.getUint8(o + 13);
+      b = view.getUint8(o + 14);
+    }
     const wx = e[0] * lx + e[4] * ly + e[8] * lz + e[12];
     const wy = e[1] * lx + e[5] * ly + e[9] * lz + e[13];
     const wz = e[2] * lx + e[6] * ly + e[10] * lz + e[14];
@@ -99,9 +114,9 @@ function ingestOverlay(header, buffer) {
     overlayPositions[p] = wx;
     overlayPositions[p + 1] = wy;
     overlayPositions[p + 2] = wz;
-    overlayColors[p] = view.getUint8(o + 12);
-    overlayColors[p + 1] = view.getUint8(o + 13);
-    overlayColors[p + 2] = view.getUint8(o + 14);
+    overlayColors[p] = r;
+    overlayColors[p + 1] = g;
+    overlayColors[p + 2] = b;
 
     bounds.expandByPoint(t.set(wx, wy, wz));
 
@@ -136,8 +151,23 @@ function ingestOverlay(header, buffer) {
 const baseChunks = new Map(); // chunk_key -> { points, positions, colors, count, capacity, box }
 let basePointCount = 0;
 
-function decodePoints(buffer, count, positions, colors, offset) {
+function decodePoints(buffer, count, positions, colors, offset, header) {
   const view = new DataView(buffer);
+  if (header.point_format === BASE_FORMAT) {
+    const [ox, oy, oz] = header.origin;
+    const q = header.quantum;
+    for (let i = 0; i < count; i++) {
+      const o = i * Q8_STRIDE;
+      const p = (offset + i) * 3;
+      positions[p] = ox + (view.getUint8(o) + 0.5) * q; // cell centre, world-frame
+      positions[p + 1] = oy + (view.getUint8(o + 1) + 0.5) * q;
+      positions[p + 2] = oz + (view.getUint8(o + 2) + 0.5) * q;
+      colors[p] = view.getUint8(o + 3);
+      colors[p + 1] = view.getUint8(o + 4);
+      colors[p + 2] = view.getUint8(o + 5);
+    }
+    return;
+  }
   for (let i = 0; i < count; i++) {
     const o = i * STRIDE;
     const p = (offset + i) * 3;
@@ -188,7 +218,7 @@ function ingestBaseChunk(header, buffer) {
     capacity,
     box: new THREE.Box3().makeEmpty(),
   };
-  decodePoints(buffer, count, entry.positions, entry.colors, 0);
+  decodePoints(buffer, count, entry.positions, entry.colors, 0, header);
   extendBox(entry.box, entry.positions, 0, count);
   attachBuffers(entry);
   updateBounds(entry);
@@ -217,7 +247,7 @@ function appendBaseChunk(header, buffer) {
     entry.capacity = capacity;
     attachBuffers(entry);
   }
-  decodePoints(buffer, added, entry.positions, entry.colors, entry.count);
+  decodePoints(buffer, added, entry.positions, entry.colors, entry.count, header);
   extendBox(entry.box, entry.positions, entry.count, needed);
   const geometry = entry.points.geometry;
   geometry.getAttribute('position').needsUpdate = true;
@@ -261,7 +291,7 @@ function connect(sessionId) {
   currentSession = sessionId;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   // lod=1 → view-driven base layer (chunk_lod/chunk_drop) instead of a full bootstrap.
-  ws = new WebSocket(`${proto}://${location.host}/ws/view?session_id=${encodeURIComponent(sessionId)}&lod=1`);
+  ws = new WebSocket(`${proto}://${location.host}/ws/view?session_id=${encodeURIComponent(sessionId)}&lod=1&fmt=${BASE_FORMAT}`);
   ws.binaryType = 'arraybuffer';
   setStatus('connecting', false);
   els.session.textContent = sessionId;

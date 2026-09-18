@@ -227,8 +227,11 @@ Each rung is independently reviewable and (for the server logic) unit-testable:
   walk, one viewer holding the whole scene: keyframes 4.46 MB (307), deltas 2.38 MB (3060); the
   same 3060 refreshes as whole-chunk re-sends would have been 112 MB (56 MB at the old 500 ms
   tick). The live overlay was 36.8 MB over the same window and is now the dominant per-viewer
-  stream; culling it per viewer, or making it optional, is the next lever, followed by the
-  quantised wire format.
+  stream; culling it per viewer, or making it optional, is the next lever.
+
+  With the quantised formats (`docs/protocol-v1.md`: `xyzi_q4_v2` in, `q8_chunk_v2` out) the same
+  scenario metered 1.25 MB keyframes + 0.62 MB deltas and a 5.85 MB overlay over 12 s, and
+  permessage-deflate would halve the keyframes again (0.62 MB) and take the deltas to 0.40 MB.
 
 ## Status / recommendation
 

@@ -1,9 +1,13 @@
 // Headless LOD viewer that holds a wide view of a session and meters what it receives:
 // keyframe bytes, delta bytes, what the same refreshes would have cost as whole-chunk
-// re-sends, and live-overlay bytes. Usage: npm run meter:viewer -- ws://host:8080 <session> [seconds]
+// re-sends, and live-overlay bytes, plus what permessage-deflate would make of each
+// stream. Usage: npm run meter:viewer -- ws://host:8080 <session> [seconds] [fmt]
+import zlib from 'node:zlib';
 import { WebSocket } from 'ws';
-const [url, session, seconds] = [process.argv[2], process.argv[3], Number(process.argv[4] ?? '15')];
-const ws = new WebSocket(`${url}/ws/view?session_id=${session}&lod=1`);
+const [url, session, seconds, fmt] = [process.argv[2], process.argv[3], Number(process.argv[4] ?? '15'), process.argv[5] ?? 'xyz_rgb_i_v1'];
+const ws = new WebSocket(`${url}/ws/view?session_id=${session}&lod=1&fmt=${fmt}`, { perMessageDeflate: false });
+const zsize = (b: Buffer) => zlib.deflateRawSync(b, { level: 1 }).byteLength;
+let keyZ = 0, deltaZ = 0, overlayZ = 0;
 ws.binaryType = 'arraybuffer';
 let pending: any = null;
 let key = 0, delta = 0, overlay = 0, wouldBeFull = 0, keyMsgs = 0, deltaMsgs = 0;
@@ -16,13 +20,15 @@ ws.on('message', (data, isBinary) => {
   const bytes = (data as Buffer).byteLength;
   const h = pending; pending = null;
   if (!h) return;
-  if (h.type === 'chunk_lod') { key += bytes; keyMsgs++; held.set(h.chunk_key, h.point_count); }
-  else if (h.type === 'chunk_delta') { delta += bytes; deltaMsgs++; const n = (held.get(h.chunk_key) ?? 0) + h.point_count; held.set(h.chunk_key, n); wouldBeFull += n * 18; }
-  else if (h.type === 'chunk_update') overlay += bytes;
+  const buf = data as Buffer;
+  if (h.type === 'chunk_lod') { key += bytes; keyZ += zsize(buf); keyMsgs++; held.set(h.chunk_key, h.point_count); }
+  else if (h.type === 'chunk_delta') { delta += bytes; deltaZ += zsize(buf); deltaMsgs++; const n = (held.get(h.chunk_key) ?? 0) + h.point_count; held.set(h.chunk_key, n); wouldBeFull += n * 18; }
+  else if (h.type === 'chunk_update') { overlay += bytes; overlayZ += zsize(buf); }
 });
 setTimeout(() => {
   const mb = (b: number) => (b / 1e6).toFixed(2);
-  console.log(`base layer over ${seconds}s: keyframes ${mb(key)} MB (${keyMsgs}), deltas ${mb(delta)} MB (${deltaMsgs}); the same refreshes as whole-chunk re-sends would have been ${mb(wouldBeFull)} MB`);
-  console.log(`live overlay over the same window: ${mb(overlay)} MB`);
+  console.log(`format ${fmt}, ${seconds}s`);
+  console.log(`base layer: keyframes ${mb(key)} MB (${keyMsgs}, deflated ${mb(keyZ)}), deltas ${mb(delta)} MB (${deltaMsgs}, deflated ${mb(deltaZ)}); the same refreshes as whole-chunk 18 B re-sends would have been ${mb(wouldBeFull)} MB`);
+  console.log(`live overlay: ${mb(overlay)} MB (deflated ${mb(overlayZ)})`);
   ws.close(); process.exit(0);
 }, seconds * 1000);

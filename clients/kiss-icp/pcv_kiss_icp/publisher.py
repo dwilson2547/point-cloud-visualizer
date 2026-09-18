@@ -18,6 +18,9 @@ from .vlp16 import Spin, SpinAssembler, load_calibration
 
 POINT_FORMAT = "xyz_rgb_i_v1"
 POINT_STRIDE_BYTES = 18
+POINT_FORMAT_Q4 = "xyzi_q4_v2"  # int16 xyz at 4 mm + u8 intensity: 7 B/point
+Q4_STRIDE_BYTES = 7
+Q4_METERS = 0.004
 PROTOCOL_VERSION = 1
 
 WIRE_DTYPE = np.dtype(
@@ -33,6 +36,7 @@ WIRE_DTYPE = np.dtype(
     ],
     align=False,
 )
+Q4_DTYPE = np.dtype([("x", "<i2"), ("y", "<i2"), ("z", "<i2"), ("intensity", "u1")], align=False)
 
 
 class PacketReceiver:
@@ -78,11 +82,13 @@ class IngestClient:
         session_id: str,
         publisher_id: str,
         frame_id: str,
+        point_format: str = POINT_FORMAT_Q4,
     ) -> None:
         self.connection = connection
         self.session_id = session_id
         self.publisher_id = publisher_id
         self.frame_id = frame_id
+        self.point_format = point_format
         self.sequence = 0
 
     def create_session(self) -> None:
@@ -125,7 +131,8 @@ class IngestClient:
             }
         )
 
-        payload, bounds = encode_points(points)
+        payload, bounds = encode_points(points, self.point_format)
+        stride = Q4_STRIDE_BYTES if self.point_format == POINT_FORMAT_Q4 else POINT_STRIDE_BYTES
         batch_sequence = self._next_sequence()
         self._send_json(
             {
@@ -135,11 +142,12 @@ class IngestClient:
                 "sequence": batch_sequence,
                 "timestamp": timestamp,
                 "pose_sequence": pose_sequence,
-                "point_count": int(points.shape[0]),
-                "point_format": POINT_FORMAT,
+                # From the payload, not the input: encode_points drops non-finite rows.
+                "point_count": len(payload) // stride,
+                "point_format": self.point_format,
                 "encoding": "binary_le",
                 "compression": "none",
-                "stride_bytes": POINT_STRIDE_BYTES,
+                "stride_bytes": stride,
                 "bounds_local": bounds,
             }
         )
@@ -176,11 +184,22 @@ class IngestClient:
         return json.loads(message)
 
 
-def encode_points(points: np.ndarray) -> tuple[bytes, dict[str, list[float]]]:
+def encode_points(points: np.ndarray, point_format: str = POINT_FORMAT_Q4) -> tuple[bytes, dict[str, list[float]]]:
     finite = np.asarray(points, dtype=np.float64)
     finite = finite[np.isfinite(finite).all(axis=1)]
     if finite.size == 0:
         raise ValueError("KISS-ICP frame contains no finite points")
+    minimum = finite.min(axis=0).tolist()
+    maximum = finite.max(axis=0).tolist()
+
+    if point_format == POINT_FORMAT_Q4:
+        ranges = np.linalg.norm(finite, axis=1)
+        shade = np.clip(255.0 * (1.0 - ranges / max(float(ranges.max()), 1.0)), 48, 220)
+        wire = np.zeros(finite.shape[0], dtype=Q4_DTYPE)
+        q = np.clip(np.round(finite / Q4_METERS), -32768, 32767).astype(np.int16)
+        wire["x"], wire["y"], wire["z"] = q[:, 0], q[:, 1], q[:, 2]
+        wire["intensity"] = shade.astype(np.uint8)
+        return wire.tobytes(), {"min": minimum, "max": maximum}
 
     wire = np.zeros(finite.shape[0], dtype=WIRE_DTYPE)
     wire["x"] = finite[:, 0]
@@ -192,8 +211,6 @@ def encode_points(points: np.ndarray) -> tuple[bytes, dict[str, list[float]]]:
     wire["g"] = np.clip(colors + 20, 0, 255).astype(np.uint8)
     wire["b"] = np.clip(255 - colors // 2, 0, 255).astype(np.uint8)
     wire["intensity"] = (wire["g"].astype(np.uint16) * 257).astype(np.uint16)
-    minimum = finite.min(axis=0).tolist()
-    maximum = finite.max(axis=0).tolist()
     return wire.tobytes(), {"min": minimum, "max": maximum}
 
 
@@ -251,6 +268,7 @@ def run(options: argparse.Namespace) -> None:
             session_id=options.session_id,
             publisher_id=options.publisher_id,
             frame_id=options.frame_id,
+            point_format=options.point_format,
         )
         ingest.create_session()
         receiver.start()
@@ -304,6 +322,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-range", type=float, default=100.0)
     parser.add_argument("--voxel-size", type=float)
     parser.add_argument("--kiss-config", type=str)
+    parser.add_argument(
+        "--point-format", choices=[POINT_FORMAT, POINT_FORMAT_Q4], default=POINT_FORMAT_Q4,
+        help="wire format for point batches (q4 is 7 B/point; v1 is the 18 B/point original)",
+    )
     return parser.parse_args()
 
 

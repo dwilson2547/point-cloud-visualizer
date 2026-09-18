@@ -46,3 +46,29 @@ def test_pose_round_trip() -> None:
         m = pose_to_matrix(t, q)
         back = matrix_to_pose(m)
         assert np.allclose(pose_to_matrix(back["translation_m"], back["rotation_xyzw"]), m, atol=1e-9)
+
+
+def test_q4_encode_decode_round_trip_and_log_format_field() -> None:
+    from pcv_align.log import POINT_FORMAT_Q4, decode_points, encode_points
+
+    pts = np.array([[1.2345, -0.0011, 7.777], [-3.0, 2.5, 0.004]])
+    payload = encode_points(pts, POINT_FORMAT_Q4, np.array([7, 200], dtype=np.uint8))
+    assert len(payload) == 2 * 7
+    back = decode_points(payload, POINT_FORMAT_Q4)
+    assert np.abs(back - pts).max() <= 0.002 + 1e-9
+
+    # A logged q4 record parses to the same points.
+    header = json.dumps(
+        {
+            "sequence": 2,
+            "pose_sequence": 1,
+            "timestamp": "x",
+            "point_count": 2,
+            "point_format": POINT_FORMAT_Q4,
+            "pose": {"translation_m": [0, 0, 0], "rotation_xyzw": [0, 0, 0, 1]},
+        }
+    ).encode()
+    body = header + payload
+    data = struct.pack("<IIII", 0x4C564350, len(header), len(payload), zlib.crc32(body)) + body
+    [batch] = list(parse_log(data))
+    assert np.abs(batch.points - pts).max() <= 0.002 + 1e-9

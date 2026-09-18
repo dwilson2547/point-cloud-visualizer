@@ -76,6 +76,8 @@ The repository now includes a first-pass TypeScript server with:
 - live viewer fan-out of accepted point batches
 - view-driven LOD base layer refreshed by append-only deltas (`npm run meter:viewer` measures a
   viewer's keyframe, delta and overlay bytes)
+- quantised wire formats: `xyzi_q4_v2` for ingest and `q8_chunk_v2` for the base layer, 7 bytes per
+  point each, plus permessage-deflate on both WebSocket roles (`docs/protocol-v1.md`)
 
 This is still a scaffold, but storage is now disk-backed. The live write path appends each raw
 batch to the session log, then partitions its points into fixed world chunks and fuses them into
@@ -107,6 +109,7 @@ The chunk store is configurable by environment variables:
 - `MAX_RETAINED_POSES` — recent poses retained per active session (default: `64`)
 - `MAX_VIEWER_BUFFERED_BYTES` — disconnect viewers that stop consuming before their outbound queue
   exceeds this limit (default: `33554432`)
+- `WS_DEFLATE` — set to `0` to disable permessage-deflate on both WebSocket endpoints
 - `LIVE_REFRESH_MS` — coalescing interval for refreshing changed LOD chunks (default: `250`);
   refreshes send only the voxels added since the viewer's version (`chunk_delta`), with periodic
   keyframes

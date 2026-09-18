@@ -27,6 +27,7 @@ import {
 } from './protocol.js';
 import { ChunkStore, DurableBatchError, type ObservationFilter, type RebuildResult } from './chunk-store.js';
 import { validatePoseCorrections } from './pose-corrections.js';
+import { INGEST_FORMATS, SERVE_FORMATS, SERVE_FORMAT_Q8, Q8_STEPS, Q8_STRIDE_BYTES, encodeQ8Chunk } from './point-formats.js';
 import { SessionStore } from './session-store.js';
 import {
   buildFrustum,
@@ -50,6 +51,8 @@ interface ConnectionState {
   frustum?: Frustum;
   lastViewAt?: number;
   filter?: ObservationFilter;
+  // Served point format for this viewer's base layer (?fmt=; default xyz_rgb_i_v1).
+  serveFormat?: string;
 }
 
 // What an LOD viewer holds for one chunk: the level, the chunk version (fine voxel
@@ -109,8 +112,14 @@ const checkpointTickMs = parseIntegerEnv(process.env.CHECKPOINT_TICK_MS, 1000);
 const checkpointChunksPerTick = parseIntegerEnv(process.env.CHECKPOINT_CHUNKS_PER_TICK, 8);
 let shuttingDown = false;
 const maxPayloadBytes = Math.max(64 * 1024, maxPointsPerBatch * POINT_STRIDE_BYTES);
-const ingestWss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
-const viewerWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+// permessage-deflate on both roles (clients negotiate it; ws, browsers and the Python
+// websockets library all do by default). Level 1: the payloads are integer-heavy once
+// quantised and the win is in the format, so spend little CPU here.
+const wsDeflate = (process.env.WS_DEFLATE ?? '1') !== '0'
+  ? { zlibDeflateOptions: { level: 1 }, threshold: 1024, serverNoContextTakeover: true, clientNoContextTakeover: true }
+  : false;
+const ingestWss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes, perMessageDeflate: wsDeflate });
+const viewerWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: wsDeflate });
 
 // Static viewer assets live in <project>/public; resolve relative to this module
 // so it works from both src/ (tsx) and dist/ (built).
@@ -138,6 +147,9 @@ const server = http.createServer((req, res) => {
         protocolVersion: PROTOCOL_VERSION,
         pointFormat: POINT_FORMAT,
         pointStrideBytes: POINT_STRIDE_BYTES,
+        ingestFormats: Object.keys(INGEST_FORMATS),
+        serveFormats: Object.keys(SERVE_FORMATS),
+        wsDeflate: wsDeflate !== false,
         sessions: sessionStore.getSessionCount(),
         storage: chunkStore.getStorageSummary(),
       }),
@@ -360,8 +372,13 @@ server.on('upgrade', (req, socket, head) => {
 
   if (url.pathname === '/ws/view') {
     const lodMode = url.searchParams.get('lod') === '1';
+    const fmt = url.searchParams.get('fmt') ?? POINT_FORMAT;
+    if (!(fmt in SERVE_FORMATS)) {
+      socket.destroy();
+      return;
+    }
     viewerWss.handleUpgrade(req, socket, head, (ws) => {
-      configureViewerSocket(ws, url.searchParams.get('session_id') ?? undefined, lodMode);
+      configureViewerSocket(ws, url.searchParams.get('session_id') ?? undefined, lodMode, fmt);
     });
     return;
   }
@@ -454,7 +471,7 @@ function handleIngestText(ws: WebSocket, state: ConnectionState, payload: string
       if (state.pendingBatchHeader) {
         throw new Error('Received point_batch_header while previous batch is still pending');
       }
-      if (message.point_format !== POINT_FORMAT) {
+      if (!(message.point_format in INGEST_FORMATS)) {
         throw new Error(`Unsupported point format ${message.point_format}`);
       }
       if (message.encoding !== 'binary_le' || message.compression !== 'none') {
@@ -513,8 +530,13 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
   broadcastChunkUpdate(accepted.header, accepted.payload, pose);
 }
 
-function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMode = false): void {
-  const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sent: new Map() };
+function configureViewerSocket(
+  ws: WebSocket,
+  sessionIdFromQuery?: string,
+  lodMode = false,
+  serveFormat: string = POINT_FORMAT,
+): void {
+  const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sent: new Map(), serveFormat };
   viewerStates.set(ws, state);
   ws.on('error', (error) => {
     console.error(`Viewer WebSocket error: ${error.message}`);
@@ -684,7 +706,7 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
     if (sent.get(cell.chunkKey)?.level === level) {
       continue; // already at this level — no re-send on a camera nudge
     }
-    sendChunkKeyframe(ws, message.session_id, cell.chunkKey, level, sent, state.filter);
+    sendChunkKeyframe(ws, message.session_id, cell.chunkKey, level, state);
   }
 
   for (const chunkKey of [...sent.keys()]) {
@@ -762,7 +784,7 @@ function refreshChunkForViewer(
   }
   const held = sent.get(cell.chunkKey);
   if (!held || held.level !== level) {
-    sendChunkKeyframe(ws, sessionId, cell.chunkKey, level, sent, state.filter);
+    sendChunkKeyframe(ws, sessionId, cell.chunkKey, level, state);
     return;
   }
   const delta = chunkStore.deriveChunk(sessionId, cell.chunkKey, level, state.filter, held.version);
@@ -770,13 +792,14 @@ function refreshChunkForViewer(
   const diverged = delta.total !== held.count + added;
   const settled = delta.version >= 2 * Math.max(held.keyframeVersion, 1);
   if (diverged || settled) {
-    sendChunkKeyframe(ws, sessionId, cell.chunkKey, level, sent, state.filter);
+    sendChunkKeyframe(ws, sessionId, cell.chunkKey, level, state);
     return;
   }
   if (added === 0) {
     held.version = delta.version;
     return;
   }
+  const served = encodeServed(cell.chunkKey, delta.points, state.serveFormat ?? POINT_FORMAT);
   const message: ChunkDeltaMessage = {
     type: 'chunk_delta',
     session_id: sessionId,
@@ -784,10 +807,9 @@ function refreshChunkForViewer(
     level,
     version: delta.version,
     point_count: added,
-    point_format: POINT_FORMAT,
-    stride_bytes: POINT_STRIDE_BYTES,
+    ...served.fields,
   };
-  if (sendPair(ws, message, delta.points)) {
+  if (sendPair(ws, message, served.payload)) {
     held.version = delta.version;
     held.count = delta.total;
   }
@@ -812,10 +834,10 @@ function sendChunkKeyframe(
   sessionId: string,
   chunkKey: string,
   level: number,
-  sent: Map<string, SentChunk>,
-  filter?: ObservationFilter,
+  state: ConnectionState,
 ): void {
-  const full = chunkStore.deriveChunk(sessionId, chunkKey, level, filter);
+  const sent = state.sent ?? (state.sent = new Map());
+  const full = chunkStore.deriveChunk(sessionId, chunkKey, level, state.filter);
   if (full.points.byteLength === 0) {
     // Nothing passes (an empty chunk, or the filter removed everything): make sure
     // the viewer is not left showing a stale version.
@@ -825,9 +847,28 @@ function sendChunkKeyframe(
     }
     return;
   }
-  if (sendChunkLod(ws, sessionId, chunkKey, level, full.version, full.points)) {
+  if (sendChunkLod(ws, sessionId, chunkKey, level, full.version, full.points, state.serveFormat ?? POINT_FORMAT)) {
     sent.set(chunkKey, { level, version: full.version, count: full.total, keyframeVersion: full.version });
   }
+}
+
+// Encode internal world-frame points for a viewer's served format, with the message
+// fields that describe the payload.
+function encodeServed(
+  chunkKey: string,
+  internal: Buffer,
+  format: string,
+): { payload: Buffer; fields: { point_format: string; stride_bytes: number; origin?: [number, number, number]; quantum?: number } } {
+  if (format === SERVE_FORMAT_Q8) {
+    const [cx, cy, cz] = chunkKey.split('_').map(Number);
+    const size = chunkStore.chunkSizeMeters;
+    const origin: [number, number, number] = [cx * size, cy * size, cz * size];
+    return {
+      payload: encodeQ8Chunk(internal, origin, size),
+      fields: { point_format: SERVE_FORMAT_Q8, stride_bytes: Q8_STRIDE_BYTES, origin, quantum: size / Q8_STEPS },
+    };
+  }
+  return { payload: internal, fields: { point_format: POINT_FORMAT, stride_bytes: POINT_STRIDE_BYTES } };
 }
 
 function toObservationFilter(message: ViewerViewMessage): ObservationFilter | undefined {
@@ -906,7 +947,9 @@ function sendChunkLod(
   level: number,
   version: number,
   worldPoints: Buffer,
+  format: string,
 ): boolean {
+  const served = encodeServed(chunkKey, worldPoints, format);
   const message: ChunkLodMessage = {
     type: 'chunk_lod',
     session_id: sessionId,
@@ -914,10 +957,9 @@ function sendChunkLod(
     level,
     version,
     point_count: worldPoints.byteLength / POINT_STRIDE_BYTES,
-    point_format: POINT_FORMAT,
-    stride_bytes: POINT_STRIDE_BYTES,
+    ...served.fields,
   };
-  return sendPair(ws, message, worldPoints);
+  return sendPair(ws, message, served.payload);
 }
 
 function sendChunkDrop(ws: WebSocket, sessionId: string, chunkKey: string): void {

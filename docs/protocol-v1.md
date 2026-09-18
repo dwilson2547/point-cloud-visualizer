@@ -203,6 +203,42 @@ The v1 layout includes one pad byte so the layout can be extended or aligned mor
 some implementations. If alignment pressure disappears in implementation, this can be revised before
 code is published as stable.
 
+### Binary point layout: `xyzi_q4_v2` (ingest)
+
+A quantised ingest format for lidar publishers, negotiated per batch through `point_format` and
+`stride_bytes` (defined in `src/point-formats.ts`):
+
+| Field | Type | Bytes |
+|---|---|---|
+| `x`, `y`, `z` | int16 each, sensor frame, in 4 mm steps (±131 m) | 6 |
+| `intensity` | uint8 | 1 |
+
+Total: **7 bytes**, 2.6× smaller than v1. It carries no colour; the server fuses it with r = g = b =
+intensity. The batch log stores the payload as sent, so the saving applies to disk as well as the
+wire, and the store decodes at fuse time. Both formats stay accepted; the KISS-ICP publisher and the
+demo publisher default to this one.
+
+### Binary point layout: `q8_chunk_v2` (serve)
+
+A viewer connecting with `?fmt=q8_chunk_v2` receives `chunk_lod` and `chunk_delta` payloads as:
+
+| Field | Type | Bytes |
+|---|---|---|
+| `x`, `y`, `z` | uint8 each, relative to the chunk origin in steps of `chunk_size / 256` | 3 |
+| `r`, `g`, `b` | uint8 | 3 |
+| `intensity` | uint8 | 1 |
+
+Total: **7 bytes**. The message carries `origin` and `quantum`; the viewer reconstructs cell
+centres. With a 2 m chunk the step is 7.8 mm, below the 4 cm fusion voxel, so nothing visible is
+lost. Without `fmt` the server keeps sending `xyz_rgb_i_v1`.
+
+### Compression
+
+Both WebSocket endpoints offer permessage-deflate (level 1, no context takeover; `WS_DEFLATE=0`
+disables it). Browsers, `ws` and the Python `websockets` library negotiate it by default. Measured
+on the synthetic room at VLP-16 density, deflate takes the quantised streams a further 1.5–2×; on
+the float formats it was worth about 1.6×.
+
 ### `point_batch_ack`
 
 Sent by the server after a batch has been validated, appended and fsynced to the session's batch
@@ -322,6 +358,6 @@ Explicitly out of scope for protocol v1:
 - gRPC or gRPC-Web transport
 - server-side SLAM / Point-LIO
 - loop closure and pose graph correction
-- compressed point payloads
+- ~~compressed point payloads~~ — quantised formats and permessage-deflate, above
 - multi-publisher consistency guarantees beyond per-session ordering
 - mutable historical rewrites of previously accepted batches

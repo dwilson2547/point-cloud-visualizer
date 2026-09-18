@@ -27,6 +27,7 @@ export interface LogRecordHeader {
   timestamp: string;
   point_count: number;
   pose: Pose;
+  point_format?: string; // absent in records written before v2 formats: xyz_rgb_i_v1
 }
 
 export interface LogRecord {

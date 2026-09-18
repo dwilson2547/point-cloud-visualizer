@@ -8,6 +8,7 @@ import {
   type SessionMetadata,
   type ViewerSessionStateMessage,
 } from './protocol.js';
+import { INGEST_FORMATS } from './point-formats.js';
 
 export interface SessionRecord {
   sessionId: string;
@@ -169,11 +170,12 @@ export class SessionStore {
     const session = this.requireOwnedSession(header.session_id, header.publisher_id);
     this.assertOpen(session);
     this.assertNextSequence(session, header.sequence);
-    if (header.point_format !== POINT_FORMAT) {
+    const stride = INGEST_FORMATS[header.point_format];
+    if (stride === undefined) {
       throw new Error(`Unsupported point format ${header.point_format}`);
     }
-    if (header.stride_bytes !== POINT_STRIDE_BYTES) {
-      throw new Error(`Unsupported stride ${header.stride_bytes}`);
+    if (header.stride_bytes !== stride) {
+      throw new Error(`Unsupported stride ${header.stride_bytes} for ${header.point_format}`);
     }
     if (
       !Number.isInteger(header.point_count) ||
@@ -198,7 +200,9 @@ export class SessionStore {
         `Unknown pose_sequence ${header.pose_sequence}; send a fresh pose after resuming a session`,
       );
     }
-    validatePointPayload(payload);
+    if (header.point_format === POINT_FORMAT) {
+      validatePointPayload(payload); // integer formats cannot carry NaN or infinity
+    }
 
     return { session, header, payload, pose };
   }

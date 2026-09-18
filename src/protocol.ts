@@ -188,6 +188,9 @@ export interface ChunkLodMessage {
   point_count: number;
   point_format: string;
   stride_bytes: number;
+  // For chunk-relative formats (q8_chunk_v2): the chunk origin and metres per step.
+  origin?: [number, number, number];
+  quantum?: number;
 }
 
 // Appends points to a chunk the viewer already holds at this level (a keyframe sent
@@ -203,6 +206,8 @@ export interface ChunkDeltaMessage {
   point_count: number;
   point_format: string;
   stride_bytes: number;
+  origin?: [number, number, number];
+  quantum?: number;
 }
 
 // Tells an LOD-mode viewer a chunk has left the view; the viewer frees its buffer.
