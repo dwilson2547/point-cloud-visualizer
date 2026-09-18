@@ -10,6 +10,14 @@ export interface SessionMetadata {
   project_id?: string;
   site_id?: string;
   room_id?: string;
+  // Sensor field of view for the observation counters (docs/observation-filter.md).
+  // Missing fields fall back to the server defaults (a level VLP-16).
+  sensor_fov?: {
+    elevation_min_deg?: number;
+    elevation_max_deg?: number;
+    max_range_m?: number;
+  };
+  [key: string]: unknown;
 }
 
 export interface Pose {
@@ -88,6 +96,13 @@ export interface ViewerViewMessage {
   viewport_px: [number, number]; // width, height
   near_m: number;
   far_m: number;
+  // Optional serve-time observation filter for the base layer: voxels with fewer
+  // than min_hits samples, or a hits/opportunities ratio below min_ratio, are not
+  // sent. Omitted or {1, 0} means unfiltered.
+  filter?: {
+    min_hits?: number;
+    min_ratio?: number;
+  };
 }
 
 export type ClientControlMessage =

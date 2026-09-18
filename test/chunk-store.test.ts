@@ -905,3 +905,93 @@ test('a correction re-fuses only the batches and chunks it moves, matching a ful
   assert.equal(cellsOf(), '0_0_0 2_0_0 4_0_0');
   chunkStore.close();
 });
+
+test('observation filter drops voxels the sensor kept looking at but rarely hit', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-obs-'));
+  const sessionStore = new SessionStore();
+  let chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'obs',
+    publisher_id: 'obs-pub',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+  let sequence = 0;
+  // Stationary sensor at the origin, identity pose, level VLP-16 field of view.
+  const storeBatch = (points: Array<[number, number, number]>): void => {
+    const poseSequence = ++sequence;
+    const batchSequence = ++sequence;
+    sessionStore.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: 'obs',
+      publisher_id: 'obs-pub',
+      sequence: poseSequence,
+      timestamp: '2026-07-10T00:00:01Z',
+      pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    const payload = Buffer.alloc(points.length * POINT_STRIDE_BYTES);
+    points.forEach(([x, y, z], i) => {
+      payload.writeFloatLE(x, i * POINT_STRIDE_BYTES);
+      payload.writeFloatLE(y, i * POINT_STRIDE_BYTES + 4);
+      payload.writeFloatLE(z, i * POINT_STRIDE_BYTES + 8);
+    });
+    const accepted = sessionStore.preparePointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: 'obs',
+        publisher_id: 'obs-pub',
+        sequence: batchSequence,
+        timestamp: '2026-07-10T00:00:01Z',
+        pose_sequence: poseSequence,
+        point_count: points.length,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    chunkStore.storeAcceptedBatchDurably(accepted, { ...sessionStore.listSessions()[0], lastSequence: batchSequence });
+    sessionStore.commitPointBatch(accepted);
+  };
+  const finest = 99;
+  const count = (chunkKey: string, filter?: { minHits: number; minRatio: number }): number =>
+    chunkStore.deriveChunkLevel('obs', chunkKey, finest, filter).byteLength / POINT_STRIDE_BYTES;
+
+  // Ten batches hit the wall at (5,0,0). Batch 3 also carries a flier in the same
+  // chunk and batch 1 a point straight up, which the sensor's ±15° band never covers again.
+  for (let i = 0; i < 10; i++) {
+    const points: Array<[number, number, number]> = [[5.01, 0.01, 0.01]];
+    if (i === 0) points.push([0.01, 0.01, 5.01]);
+    if (i === 2) points.push([5.01, 0.51, 0.01]);
+    storeBatch(points);
+  }
+  chunkStore.checkpointSession('obs');
+  const chunks = new Map(chunkStore.listSessionChunks('obs').map((c) => [c.chunkKey, c]));
+  assert.equal(chunks.get('5_0_0')?.opportunities, 10, 'wall chunk was in view for every batch');
+  assert.equal(chunks.get('0_0_5')?.opportunities, 1, 'overhead chunk only counted when it got a point');
+
+  assert.equal(count('5_0_0'), 2, 'unfiltered: wall voxel + flier');
+  assert.equal(count('5_0_0', { minHits: 2, minRatio: 0 }), 1, 'min hits removes the flier');
+  assert.equal(count('5_0_0', { minHits: 1, minRatio: 0.5 }), 1, 'flier ratio is 1/8');
+  assert.equal(count('0_0_5', { minHits: 1, minRatio: 0.5 }), 1, 'a voxel with no chance to be re-seen keeps ratio 1');
+  assert.equal(count('0_0_5', { minHits: 2, minRatio: 0 }), 0);
+  assert.equal(count('5_0_0', { minHits: 1, minRatio: 0.9 }), 1, 'wall voxel: 10 hits over 10 opportunities');
+  assert.equal(chunkStore.deriveChunkLevel('obs', '5_0_0', 0, { minHits: 2, minRatio: 0 }).byteLength, POINT_STRIDE_BYTES, 'coarse levels bin only the survivors');
+
+  // Counters and baselines survive eviction, restart and a full rebuild.
+  chunkStore.flushAll();
+  assert.equal(count('5_0_0', { minHits: 1, minRatio: 0.5 }), 1, 'read back from the .acc sidecar');
+  chunkStore.close();
+  chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  assert.equal(count('5_0_0'), 2);
+  assert.equal(count('5_0_0', { minHits: 1, minRatio: 0.5 }), 1);
+  chunkStore.rebuildSession('obs');
+  assert.equal(count('5_0_0', { minHits: 1, minRatio: 0.5 }), 1, 'rebuild recounts opportunities');
+  assert.equal(new Map(chunkStore.listSessionChunks('obs').map((c) => [c.chunkKey, c])).get('5_0_0')?.opportunities, 10);
+  chunkStore.close();
+});

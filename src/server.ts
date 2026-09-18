@@ -24,7 +24,7 @@ import {
   type ViewerJoinMessage,
   type ViewerViewMessage,
 } from './protocol.js';
-import { ChunkStore, DurableBatchError, type RebuildResult } from './chunk-store.js';
+import { ChunkStore, DurableBatchError, type ObservationFilter, type RebuildResult } from './chunk-store.js';
 import { validatePoseCorrections } from './pose-corrections.js';
 import { SessionStore } from './session-store.js';
 import {
@@ -48,6 +48,7 @@ interface ConnectionState {
   sentLevels?: Map<string, number>;
   frustum?: Frustum;
   lastViewAt?: number;
+  filter?: ObservationFilter;
 }
 
 class StorageOperationError extends Error {
@@ -72,6 +73,11 @@ const chunkStore = new ChunkStore({
   maxDirtyChunks: parseIntegerEnv(process.env.MAX_DIRTY_CHUNKS, 128),
   maxChunksPerBatch: parseIntegerEnv(process.env.MAX_CHUNKS_PER_BATCH, 128),
   refuseToleranceM: process.env.REFUSE_TOLERANCE_M ? parseFloatEnv(process.env.REFUSE_TOLERANCE_M, 0.02) : undefined,
+  sensorFov: {
+    elevationMinDeg: parseSignedFloatEnv(process.env.SENSOR_ELEVATION_MIN_DEG, -15),
+    elevationMaxDeg: parseSignedFloatEnv(process.env.SENSOR_ELEVATION_MAX_DEG, 15),
+    maxRangeM: parseFloatEnv(process.env.SENSOR_MAX_RANGE_M, 100),
+  },
 });
 const sessionStore = new SessionStore({ maxPointsPerBatch, maxRetainedPoses });
 sessionStore.restoreSessions(chunkStore.loadSessions());
@@ -642,6 +648,13 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
   const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
   const frustum = buildFrustum(toViewCamera(message));
   state.frustum = frustum; // remembered so live refresh can re-evaluate changed chunks
+  const filter = toObservationFilter(message);
+  if (!sameFilter(filter, state.filter)) {
+    // A different filter changes every chunk's content: forget what was sent so the
+    // loop below re-sends (or drops) each visible chunk.
+    state.filter = filter;
+    sentLevels.clear();
+  }
 
   const visible = new Set<string>();
   for (const cell of chunkStore.listSessionChunkKeys(message.session_id)) {
@@ -653,7 +666,7 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
     if (sentLevels.get(cell.chunkKey) === level) {
       continue; // already at this level — no re-send on a camera nudge
     }
-    sendChunkAtLevel(ws, message.session_id, cell.chunkKey, level, sentLevels);
+    sendChunkAtLevel(ws, message.session_id, cell.chunkKey, level, sentLevels, state.filter);
   }
 
   for (const chunkKey of [...sentLevels.keys()]) {
@@ -728,7 +741,7 @@ function refreshChunkForViewer(
     }
     return;
   }
-  sendChunkAtLevel(ws, sessionId, cell.chunkKey, level, sentLevels);
+  sendChunkAtLevel(ws, sessionId, cell.chunkKey, level, sentLevels, state.filter);
 }
 
 function currentLadder(): LodLadder {
@@ -751,14 +764,50 @@ function sendChunkAtLevel(
   chunkKey: string,
   level: number,
   sentLevels: Map<string, number>,
+  filter?: ObservationFilter,
 ): void {
-  const worldPoints = chunkStore.deriveChunkLevel(sessionId, chunkKey, level);
+  const worldPoints = chunkStore.deriveChunkLevel(sessionId, chunkKey, level, filter);
   if (worldPoints.byteLength === 0) {
+    // Nothing passes (an empty chunk, or the filter removed everything): make sure
+    // the viewer is not left showing a stale version.
+    if (sentLevels.has(chunkKey)) {
+      sendChunkDrop(ws, sessionId, chunkKey);
+      sentLevels.delete(chunkKey);
+    }
     return;
   }
   if (sendChunkLod(ws, sessionId, chunkKey, level, worldPoints)) {
     sentLevels.set(chunkKey, level);
   }
+}
+
+function toObservationFilter(message: ViewerViewMessage): ObservationFilter | undefined {
+  const raw = message.filter;
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw !== 'object') {
+    throw new Error('viewer_view filter must be an object');
+  }
+  const minHits = raw.min_hits ?? 1;
+  const minRatio = raw.min_ratio ?? 0;
+  if (!Number.isInteger(minHits) || minHits < 1 || minHits > 1_000_000) {
+    throw new Error('viewer_view filter.min_hits must be an integer >= 1');
+  }
+  if (!Number.isFinite(minRatio) || minRatio < 0 || minRatio > 1) {
+    throw new Error('viewer_view filter.min_ratio must be within [0, 1]');
+  }
+  if (minHits === 1 && minRatio === 0) {
+    return undefined;
+  }
+  return { minHits, minRatio };
+}
+
+function sameFilter(a?: ObservationFilter, b?: ObservationFilter): boolean {
+  if (!a || !b) {
+    return !a && !b;
+  }
+  return a.minHits === b.minHits && a.minRatio === b.minRatio;
 }
 
 function toViewCamera(message: ViewerViewMessage): ViewCamera {
@@ -895,6 +944,11 @@ function normalizeRawData(data: RawData): Buffer {
 function parseIntegerEnv(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseSignedFloatEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(value ?? '');
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function parseFloatEnv(value: string | undefined, fallback: number): number {

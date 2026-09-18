@@ -21,6 +21,7 @@ class Scenario:
     step_m: float = 0.25  # travel per batch
     yaw_bias_deg_per_step: float = 0.15  # odometry drift
     scale_error: float = 1.02  # odometry over-estimates travel by 2%
+    flier_fraction: float = 0.0  # fraction of extra one-off points at random ranges
     seed: int = 7
 
 
@@ -72,6 +73,15 @@ def scan_room(pose: np.ndarray, sc: Scenario, rng: np.random.Generator) -> np.nd
     valid = np.isfinite(t_hit)
     points = local_dirs[valid] * t_hit[valid, None]
     points += rng.normal(0.0, sc.noise_m, points.shape)
+    if sc.flier_fraction > 0:
+        # Sensor artefacts: returns at a random fraction of the true range along a
+        # random subset of rays. Each appears once, so an observation filter can
+        # tell them from the walls the sensor keeps re-hitting.
+        n = int(round(points.shape[0] * sc.flier_fraction))
+        pick = rng.choice(np.flatnonzero(valid), size=n, replace=False)
+        fraction = rng.uniform(0.2, 0.9, size=n)
+        fliers = local_dirs[pick] * (t_hit[pick] * fraction)[:, None]
+        points = np.concatenate([points, fliers])
     return points
 
 

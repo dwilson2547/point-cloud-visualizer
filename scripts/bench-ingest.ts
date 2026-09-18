@@ -56,7 +56,7 @@ for (let b = 0; b < BATCHES; b++) {
   const seq = 2 * b + 2;
   const accepted: any = {
     session, payload: makeSpin(), pose: { pose },
-    header: { sequence: seq, point_count: N, session_id: 'bench' },
+    header: { sequence: seq, pose_sequence: seq - 1, timestamp: new Date().toISOString(), point_count: N, session_id: 'bench' },
   };
   const next = { ...session, lastSequence: seq, pointBatches: b + 1, totalPoints: (b + 1) * N };
   const f0 = fsyncs;
@@ -82,7 +82,7 @@ console.log(`.acc sidecar bytes=${accBytes} (${(accBytes / summary.persistedByte
 const store2 = new ChunkStore({ rootDir: fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-bench2-')), maxDirtyChunks: 100000, flushPointThreshold: 1e12, log: () => {} });
 const t1 = performance.now();
 for (let b = 0; b < 20; b++) {
-  const accepted: any = { session, payload: makeSpin(), pose: { pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] } }, header: { sequence: b + 1, point_count: N, session_id: 'bench' } };
+  const accepted: any = { session, payload: makeSpin(), pose: { pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] } }, header: { sequence: b + 1, pose_sequence: b, timestamp: new Date().toISOString(), point_count: N, session_id: 'bench' } };
   store2.storeAcceptedBatch(accepted);
 }
 console.log(`fuse-only (no disk): ${((performance.now() - t1) / 20).toFixed(1)} ms/batch`);

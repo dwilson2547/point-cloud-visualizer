@@ -43,6 +43,7 @@ Direct sensor-to-server ingestion can remain a stretch goal.
 - [`docs/protocol-v1.md`](docs/protocol-v1.md) — draft WebSocket ingest protocol for v1
 - [`docs/batch-log.md`](docs/batch-log.md) — append-only batch log: durability, checkpoint, replay
 - [`docs/alignment.md`](docs/alignment.md) — pose graph + loop closure sidecar and the corrections layer
+- [`docs/observation-filter.md`](docs/observation-filter.md) — hits/opportunities counters and the serve-time artefact filter
 - [`docs/phase-2-voxel-fusion-lod.md`](docs/phase-2-voxel-fusion-lod.md) — voxel fusion + LOD design
 - [`docs/vlp16-client.md`](docs/vlp16-client.md) — recommended Velodyne VLP-16 publisher setup
 - [`docs/vlp16-kiss-icp.md`](docs/vlp16-kiss-icp.md) — IMU-free moving VLP-16 trial with KISS-ICP
@@ -109,6 +110,9 @@ The chunk store is configurable by environment variables:
 - `CHECKPOINT_CHUNKS_PER_TICK` — chunk files one checkpoint tick may rewrite (default: `8`)
 - `REFUSE_TOLERANCE_M` — a pose correction smaller than this does not re-fuse its batch (default:
   half the fusion voxel)
+- `SENSOR_ELEVATION_MIN_DEG`, `SENSOR_ELEVATION_MAX_DEG`, `SENSOR_MAX_RANGE_M` — default sensor
+  field of view for the observation counters (default: `-15`, `15`, `100`; per-session override
+  via `create_session` `metadata.sensor_fov`)
 
 `point_batch_ack` is sent only after the batch has been appended and fsynced to the session's
 batch log and fused into the resident chunk cache. Publishers should keep at most one point batch
@@ -155,6 +159,15 @@ alignment/run.sh --session-id demo-loop --watch                # or tail a live 
 ```
 
 See [`docs/alignment.md`](docs/alignment.md) for the pipeline, tuning knobs and measured results.
+
+## Observation filter
+
+Every voxel carries a hit count and, per chunk, an opportunity count (batches whose sensor field
+of view covered the chunk). The viewer's **min hits** and **min ratio** inputs hide voxels below
+those thresholds at serve time; the store is never modified. On the synthetic fliers scenario
+(`pcv-align-demo --fliers 0.02 --azimuth-steps 1800`) `min hits 2` removes 88 % of one-off
+artefacts. See [`docs/observation-filter.md`](docs/observation-filter.md), including why the
+ratio is a weak signal for a 16-ring sensor as currently counted.
 
 ## Runtime scripts
 

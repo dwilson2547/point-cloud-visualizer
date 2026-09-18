@@ -271,6 +271,12 @@ function sendView() {
       viewport_px: [window.innerWidth, window.innerHeight],
       near_m: camera.near,
       far_m: camera.far,
+      // Observation filter for the base layer (docs/observation-filter.md). The live
+      // overlay is never filtered: it shows the raw batches as they arrive.
+      filter: {
+        min_hits: Math.max(1, Number.parseInt(els.minHits.value, 10) || 1),
+        min_ratio: Math.min(1, Math.max(0, Number.parseFloat(els.minRatio.value) || 0)),
+      },
     }),
   );
   viewDirty = false;
@@ -287,6 +293,8 @@ setInterval(() => {
 
 // ------------------------------------------------------------------------ HUD
 const els = {
+  minHits: document.getElementById('min-hits'),
+  minRatio: document.getElementById('min-ratio'),
   status: document.getElementById('status'),
   dot: document.getElementById('dot'),
   session: document.getElementById('s-session'),
@@ -344,5 +352,10 @@ document.getElementById('connect').addEventListener('click', () => {
   connect(sessionInput.value.trim());
 });
 document.getElementById('recenter').addEventListener('click', recenter);
+for (const input of [els.minHits, els.minRatio]) {
+  input.addEventListener('change', () => {
+    viewDirty = true; // next view update carries the new filter; the server re-sends
+  });
+}
 
 connect(sessionInput.value.trim());

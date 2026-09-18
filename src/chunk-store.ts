@@ -17,13 +17,18 @@ import {
   type PoseCorrections,
 } from './pose-corrections.js';
 
-// Accumulator sidecar (.acc): a 16-byte header then one 64-byte record per voxel.
+// Accumulator sidecar (.acc): a 16-byte header then one 72-byte record per voxel
+// (version 2; version 1 records were 64 bytes without the opportunity baseline).
 //   u32 magic 'PCVA', u32 version, f64 applied_sequence (last batch fused into it)
 // A headerless file (pre-log layout) is read as applied_sequence 0.
 const ACCUMULATOR_MAGIC = 0x41564350;
-const ACCUMULATOR_VERSION = 1;
+const ACCUMULATOR_VERSION = 2;
 const ACCUMULATOR_HEADER_BYTES = 16;
-const ACCUMULATOR_STRIDE_BYTES = 64;
+const ACCUMULATOR_STRIDE_BYTES = 72;
+const ACCUMULATOR_V1_STRIDE_BYTES = 64;
+// Field-of-view test samples: a 3x3x3 lattice over the chunk box, so a thin elevation
+// band crossing a face between corners is still caught down to ~1 m range.
+const FOV_SAMPLE_STEPS = [0, 0.5, 1];
 
 export interface ChunkStoreOptions {
   rootDir: string;
@@ -36,10 +41,28 @@ export interface ChunkStoreOptions {
   // A corrected pose that moves a batch by less than this (translation, or rotation at
   // 25 m range) does not re-fuse it. Default: half the fusion voxel.
   refuseToleranceM?: number;
+  // Default sensor field of view for the observation counters (per-session override via
+  // create_session metadata.sensor_fov). Defaults match a level VLP-16.
+  sensorFov?: SensorFov;
   // Test seam: called after the batch is durable in the log and again after it has
   // been fused and the session row updated.
   durableBatchHook?: (phase: 'logged' | 'fused') => void;
   log?: (message: string) => void;
+}
+
+export interface SensorFov {
+  elevationMinDeg: number;
+  elevationMaxDeg: number;
+  maxRangeM: number;
+  marginDeg?: number; // widen the band so edge voxels are not penalised (default 2)
+}
+
+// Serve-time observation filter: a voxel is shown when it has at least `minHits`
+// samples and hits / opportunities >= `minRatio`, where opportunities counts the
+// batches whose sensor pose had the voxel's chunk in view since the voxel appeared.
+export interface ObservationFilter {
+  minHits: number;
+  minRatio: number;
 }
 
 export interface ChunkMetadata {
@@ -53,6 +76,7 @@ export interface ChunkMetadata {
   batchCount: number;
   bytes: number;
   appliedSequence: number;
+  opportunities: number;
   minX: number;
   minY: number;
   minZ: number;
@@ -122,7 +146,27 @@ interface VoxelAccumulator {
   sg: number;
   sb: number;
   si: number;
-  n: number;
+  n: number; // hits
+  o0: number; // the chunk's opportunity count when this voxel first appeared
+}
+
+// Per-chunk observation counters, shared between the cell registry and the resident
+// chunk so both see the same numbers. `opportunities` counts batches whose sensor
+// field of view covered the chunk; `fovSequence` is the last batch counted, which
+// makes replay idempotent the way `appliedSequence` does for points.
+interface ChunkStats {
+  opportunities: number;
+  fovSequence: number;
+  dirty: boolean;
+}
+
+// Every chunk cell of a session, resident or on disk: geometry plus counters.
+interface CellEntry {
+  chunkKey: string;
+  chunkX: number;
+  chunkY: number;
+  chunkZ: number;
+  stats: ChunkStats;
 }
 
 // A chunk resident in memory: its full current voxel set (seeded from disk on
@@ -141,6 +185,7 @@ interface ActiveChunk {
   voxels: Map<string, VoxelAccumulator>;
   pointsSinceFlush: number;
   appliedSequence: number;
+  stats: ChunkStats;
 }
 
 interface SerializedVoxels {
@@ -179,6 +224,7 @@ export class ChunkStore {
   readonly maxDirtyChunks: number;
   readonly maxChunksPerBatch: number;
   readonly refuseToleranceM: number;
+  readonly sensorFov: SensorFov;
 
   private readonly rootDir: string;
   private readonly chunksDir: string;
@@ -192,6 +238,10 @@ export class ChunkStore {
   private readonly sessionLogs = new Map<string, SessionLogState>();
   // Per-session pose corrections, loaded lazily from data/poses; null = none on disk.
   private readonly corrections = new Map<string, PoseCorrectionMap | null>();
+  // Per-session cell registry (all chunks, resident or not), loaded lazily from the
+  // chunks table and extended as chunks are created.
+  private readonly sessionCells = new Map<string, Map<string, CellEntry>>();
+  private readonly sessionFovs = new Map<string, SensorFov>();
 
   constructor(options: ChunkStoreOptions) {
     this.rootDir = options.rootDir;
@@ -204,6 +254,7 @@ export class ChunkStore {
     this.maxDirtyChunks = options.maxDirtyChunks ?? 128;
     this.maxChunksPerBatch = options.maxChunksPerBatch ?? 128;
     this.refuseToleranceM = options.refuseToleranceM ?? this.fuseVoxelMeters / 2;
+    this.sensorFov = options.sensorFov ?? { elevationMinDeg: -15, elevationMaxDeg: 15, maxRangeM: 100 };
     this.durableBatchHook = options.durableBatchHook;
     this.log = options.log ?? ((message) => console.log(message));
 
@@ -219,6 +270,7 @@ export class ChunkStore {
   }
 
   syncSession(session: SessionSnapshot): void {
+    this.sessionFovs.delete(session.sessionId);
     this.database
       .prepare(
         `INSERT INTO sessions (
@@ -358,6 +410,11 @@ export class ChunkStore {
     let lastChunkKey = '';
     let lastActive: ActiveChunk | null = null;
 
+    // Every existing chunk the sensor could see gets an opportunity for this batch,
+    // whether or not a point lands in it. Chunks that do receive points are counted
+    // below regardless of the geometry test.
+    this.applyFieldOfView(sessionId, sequence, pose, restrictTo);
+
     for (let offset = 0; offset < payload.byteLength; offset += POINT_STRIDE_BYTES) {
       const localX = payload.readFloatLE(offset);
       const localY = payload.readFloatLE(offset + 4);
@@ -386,6 +443,11 @@ export class ChunkStore {
           restrictTo && !restrictTo.has(chunkKey)
             ? null
             : this.activateChunk(sessionId, chunkKey, chunkX, chunkY, chunkZ);
+        if (lastActive && lastActive.stats.fovSequence < sequence) {
+          lastActive.stats.opportunities += 1;
+          lastActive.stats.fovSequence = sequence;
+          lastActive.stats.dirty = true;
+        }
       }
       const active = lastActive;
       if (!active || active.appliedSequence >= sequence) {
@@ -395,7 +457,7 @@ export class ChunkStore {
       const key = voxelKey(worldX, worldY, worldZ, voxelSize);
       let acc = active.voxels.get(key);
       if (!acc) {
-        acc = { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0 };
+        acc = { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0, o0: active.stats.opportunities };
         active.voxels.set(key, acc);
       }
       acc.sx += worldX;
@@ -491,6 +553,152 @@ export class ChunkStore {
       }));
   }
 
+  // Count this batch as an opportunity for every existing chunk of the session whose
+  // box lies in the sensor's field of view from `pose`. Chunk-level, not voxel-level:
+  // a chunk partly in view counts for all its voxels, which slightly under-rates
+  // voxels near the band edge. Idempotent per chunk via fovSequence.
+  private applyFieldOfView(sessionId: string, sequence: number, pose: Pose, restrictTo?: Set<string>): void {
+    const fov = this.sessionFov(sessionId);
+    for (const cell of this.cells(sessionId).values()) {
+      if (cell.stats.fovSequence >= sequence || (restrictTo && !restrictTo.has(cell.chunkKey))) {
+        continue;
+      }
+      if (this.cellInFieldOfView(cell, pose, fov)) {
+        cell.stats.opportunities += 1;
+        cell.stats.fovSequence = sequence;
+        cell.stats.dirty = true;
+      }
+    }
+  }
+
+  private cellInFieldOfView(cell: CellEntry, pose: Pose, fov: SensorFov): boolean {
+    const size = this.chunkSizeMeters;
+    const [tx, ty, tz] = pose.translation_m;
+    const [qx, qy, qz, qw] = pose.rotation_xyzw;
+    const minX = cell.chunkX * size;
+    const minY = cell.chunkY * size;
+    const minZ = cell.chunkZ * size;
+    if (tx >= minX && tx <= minX + size && ty >= minY && ty <= minY + size && tz >= minZ && tz <= minZ + size) {
+      return true; // sensor inside the chunk
+    }
+    const margin = fov.marginDeg ?? 2;
+    const lo = ((fov.elevationMinDeg - margin) * Math.PI) / 180;
+    const hi = ((fov.elevationMaxDeg + margin) * Math.PI) / 180;
+    const maxRange2 = fov.maxRangeM * fov.maxRangeM;
+    for (const fx of FOV_SAMPLE_STEPS) {
+      for (const fy of FOV_SAMPLE_STEPS) {
+        for (const fz of FOV_SAMPLE_STEPS) {
+          const dx = minX + fx * size - tx;
+          const dy = minY + fy * size - ty;
+          const dz = minZ + fz * size - tz;
+          const r2 = dx * dx + dy * dy + dz * dz;
+          if (r2 > maxRange2) {
+            continue;
+          }
+          // Local z of the sample = third row of R^T applied to the world offset.
+          const [, , lz] = rotateAndTranslate(dx, dy, dz, -qx, -qy, -qz, qw, 0, 0, 0);
+          const elevation = Math.asin(Math.max(-1, Math.min(1, lz / Math.sqrt(r2))));
+          if (elevation >= lo && elevation <= hi) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // Chunk keys a pose can see; used by partial rebuilds to adjust counters of chunks
+  // that are not being rebuilt when a batch's pose moves.
+  private fieldOfViewKeys(sessionId: string, pose: Pose): Set<string> {
+    const fov = this.sessionFov(sessionId);
+    const keys = new Set<string>();
+    for (const cell of this.cells(sessionId).values()) {
+      if (this.cellInFieldOfView(cell, pose, fov)) {
+        keys.add(cell.chunkKey);
+      }
+    }
+    return keys;
+  }
+
+  private sessionFov(sessionId: string): SensorFov {
+    let fov = this.sessionFovs.get(sessionId);
+    if (!fov) {
+      fov = this.sensorFov;
+      const row = this.database
+        .prepare('SELECT metadata_json FROM sessions WHERE session_id = ?')
+        .get(sessionId) as { metadata_json?: string | null } | undefined;
+      if (row?.metadata_json) {
+        const meta = JSON.parse(String(row.metadata_json)) as {
+          sensor_fov?: { elevation_min_deg?: number; elevation_max_deg?: number; max_range_m?: number };
+        };
+        const override = meta.sensor_fov;
+        if (override) {
+          fov = {
+            elevationMinDeg: finiteOr(override.elevation_min_deg, fov.elevationMinDeg),
+            elevationMaxDeg: finiteOr(override.elevation_max_deg, fov.elevationMaxDeg),
+            maxRangeM: finiteOr(override.max_range_m, fov.maxRangeM),
+            marginDeg: fov.marginDeg,
+          };
+        }
+      }
+      this.sessionFovs.set(sessionId, fov);
+    }
+    return fov;
+  }
+
+  private cells(sessionId: string): Map<string, CellEntry> {
+    let cells = this.sessionCells.get(sessionId);
+    if (!cells) {
+      cells = new Map();
+      const rows = this.database
+        .prepare('SELECT chunk_key, chunk_x, chunk_y, chunk_z, opportunities, fov_sequence FROM chunks WHERE session_id = ?')
+        .all(sessionId);
+      for (const row of rows) {
+        cells.set(String(row.chunk_key), {
+          chunkKey: String(row.chunk_key),
+          chunkX: Number(row.chunk_x),
+          chunkY: Number(row.chunk_y),
+          chunkZ: Number(row.chunk_z),
+          stats: { opportunities: Number(row.opportunities), fovSequence: Number(row.fov_sequence), dirty: false },
+        });
+      }
+      this.sessionCells.set(sessionId, cells);
+    }
+    return cells;
+  }
+
+  private registerCell(sessionId: string, chunkKey: string, chunkX: number, chunkY: number, chunkZ: number): CellEntry {
+    const cells = this.cells(sessionId);
+    let cell = cells.get(chunkKey);
+    if (!cell) {
+      cell = { chunkKey, chunkX, chunkY, chunkZ, stats: { opportunities: 0, fovSequence: 0, dirty: true } };
+      cells.set(chunkKey, cell);
+    }
+    return cell;
+  }
+
+  // Write counters for cells whose on-disk voxels are current (not resident, or
+  // resident and clean), so the DB row and the .acc snapshot always describe the same
+  // moment. Dirty resident chunks carry their counters when they are persisted.
+  private flushCellStats(sessionId: string): void {
+    const update = this.database.prepare(
+      'UPDATE chunks SET opportunities = ?, fov_sequence = ? WHERE session_id = ? AND chunk_key = ?',
+    );
+    for (const cell of this.cells(sessionId).values()) {
+      if (!cell.stats.dirty) {
+        continue;
+      }
+      const active = this.activeChunks.get(`${sessionId}:${cell.chunkKey}`);
+      if (active && active.pointsSinceFlush > 0) {
+        continue;
+      }
+      const result = update.run(cell.stats.opportunities, cell.stats.fovSequence, sessionId, cell.chunkKey);
+      if (Number(result.changes) > 0) {
+        cell.stats.dirty = false;
+      }
+    }
+  }
+
   // The pose a batch is fused with: its logged pose unless the session has corrections.
   effectivePose(sessionId: string, poseSequence: number, logged: Pose): Pose {
     const map = this.correctionMap(sessionId);
@@ -536,7 +744,7 @@ export class ChunkStore {
     if (changed.length * 2 > index.length) {
       return this.rebuildSession(sessionId);
     }
-    return this.rebuildBatches(sessionId, changed);
+    return this.rebuildBatches(sessionId, index, changed);
   }
 
   // Partial rebuild: the chunks a moved batch used to span plus the chunks it now
@@ -544,7 +752,7 @@ export class ChunkStore {
   // that chunk set so untouched chunks are never rewritten. The checkpoint is reset
   // first so a crash mid-way replays the whole log (chunk applied sequences make
   // that idempotent for the chunks that survived).
-  private rebuildBatches(sessionId: string, changed: BatchIndexRow[]): RebuildResult {
+  private rebuildBatches(sessionId: string, index: BatchIndexRow[], changed: BatchIndexRow[]): RebuildResult {
     const logPath = this.sessionLogPath(sessionId);
     const state = this.sessionLog(sessionId);
     state.sweep = undefined;
@@ -599,21 +807,68 @@ export class ChunkStore {
     }
     replay.sort((a, b) => a.sequence - b.sequence);
 
+    // Observation counters. Chunks not being rebuilt keep theirs, adjusted for the
+    // moved batches (a pose that stops seeing a chunk takes an opportunity away, one
+    // that starts seeing it adds one). Rebuilt chunks start from zero and are
+    // recounted below from every batch's pose in order, so voxel baselines come out
+    // as they would have live.
+    const cells = this.cells(sessionId);
+    for (const row of changed) {
+      const before = this.fieldOfViewKeys(sessionId, row.fusedPose);
+      const after = this.fieldOfViewKeys(sessionId, records.get(row.sequence)
+        ? this.effectivePose(sessionId, row.poseSequence, row.loggedPose)
+        : row.fusedPose);
+      for (const key of before) {
+        if (!after.has(key) && !affected.has(key)) {
+          const stats = cells.get(key)!.stats;
+          stats.opportunities = Math.max(0, stats.opportunities - 1);
+          stats.dirty = true;
+        }
+      }
+      for (const key of after) {
+        if (!before.has(key) && !affected.has(key)) {
+          const stats = cells.get(key)!.stats;
+          stats.opportunities += 1;
+          stats.dirty = true;
+        }
+      }
+    }
+
     for (const key of affected) {
       this.activeChunks.delete(`${sessionId}:${key}`);
       removeIfPresent(path.join(this.chunksDir, sessionId, `${key}.bin`));
       removeIfPresent(path.join(this.chunksDir, sessionId, `${key}.acc`));
+      const cell = cells.get(key);
+      if (cell) {
+        cell.stats.opportunities = 0;
+        cell.stats.fovSequence = 0;
+        cell.stats.dirty = true;
+      }
     }
     this.database
       .prepare('DELETE FROM chunks WHERE session_id = ? AND chunk_key IN (SELECT chunk_key FROM affected_chunks)')
       .run(sessionId);
 
-    for (const entry of replay) {
-      const record = records.get(entry.sequence) ?? readLogRecordAt(logPath, entry.logOffset);
-      const pose = this.effectivePose(sessionId, record.header.pose_sequence, record.header.pose);
-      const { spanned } = this.fuseBatch(sessionId, record.header.sequence, pose, record.payload, true, affected);
-      if (changedSequences.has(record.header.sequence)) {
-        this.recordFusedBatch(sessionId, record.header, record.offset, pose, spanned);
+    // Walk every indexed batch in order: its pose counts opportunities for the rebuilt
+    // chunks; the ones spanning them are re-fused (restricted to the rebuilt set).
+    let next = 0;
+    for (const row of index) {
+      const pose = this.effectivePose(sessionId, row.poseSequence, row.loggedPose);
+      if (next < replay.length && replay[next].sequence === row.sequence) {
+        const entry = replay[next++];
+        const record = records.get(entry.sequence) ?? readLogRecordAt(logPath, entry.logOffset);
+        const { spanned } = this.fuseBatch(sessionId, record.header.sequence, pose, record.payload, true, affected);
+        if (changedSequences.has(record.header.sequence)) {
+          this.recordFusedBatch(sessionId, record.header, record.offset, pose, spanned);
+        }
+      } else {
+        this.applyFieldOfView(sessionId, row.sequence, pose, affected);
+      }
+    }
+    // A rebuilt cell that received no points no longer exists.
+    for (const key of affected) {
+      if (!this.activeChunks.has(`${sessionId}:${key}`)) {
+        cells.delete(key);
       }
     }
     this.database.exec('DELETE FROM affected_chunks');
@@ -639,6 +894,7 @@ export class ChunkStore {
     this.database.prepare('DELETE FROM chunks WHERE session_id = ?').run(sessionId);
     this.database.prepare('DELETE FROM batch_chunks WHERE session_id = ?').run(sessionId);
     this.database.prepare('DELETE FROM batches WHERE session_id = ?').run(sessionId);
+    this.sessionCells.delete(sessionId);
 
     const state = this.sessionLog(sessionId);
     state.sweep = undefined;
@@ -681,6 +937,7 @@ export class ChunkStore {
   // sweep in one go. Returns true when the checkpoint is fully up to date.
   checkpointSession(sessionId: string, maxChunks: number = Number.POSITIVE_INFINITY): boolean {
     const state = this.sessionLog(sessionId);
+    this.flushCellStats(sessionId);
     if (!state.sweep) {
       if (state.endOffset === state.checkpointOffset && this.dirtyChunkKeys(sessionId).length === 0) {
         return true;
@@ -828,7 +1085,7 @@ export class ChunkStore {
       .prepare(
         `SELECT
           session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
-          point_count, batch_count, bytes, applied_sequence,
+          point_count, batch_count, bytes, applied_sequence, opportunities,
           min_x, min_y, min_z, max_x, max_y, max_z, updated_at
         FROM chunks
         WHERE session_id = ?
@@ -846,6 +1103,7 @@ export class ChunkStore {
         batchCount: Number(row.batch_count),
         bytes: Number(row.bytes),
         appliedSequence: Number(row.applied_sequence),
+        opportunities: Number(row.opportunities),
         minX: Number(row.min_x),
         minY: Number(row.min_y),
         minZ: Number(row.min_z),
@@ -901,29 +1159,12 @@ export class ChunkStore {
   listSessionChunkKeys(
     sessionId: string,
   ): Array<{ chunkKey: string; chunkX: number; chunkY: number; chunkZ: number }> {
-    const cells = new Map<string, { chunkKey: string; chunkX: number; chunkY: number; chunkZ: number }>();
-    const prefix = `${sessionId}:`;
-    for (const [key, active] of this.activeChunks) {
-      if (key.startsWith(prefix)) {
-        cells.set(active.chunkKey, {
-          chunkKey: active.chunkKey,
-          chunkX: active.chunkX,
-          chunkY: active.chunkY,
-          chunkZ: active.chunkZ,
-        });
-      }
-    }
-    for (const meta of this.listSessionChunks(sessionId)) {
-      if (!cells.has(meta.chunkKey)) {
-        cells.set(meta.chunkKey, {
-          chunkKey: meta.chunkKey,
-          chunkX: meta.chunkX,
-          chunkY: meta.chunkY,
-          chunkZ: meta.chunkZ,
-        });
-      }
-    }
-    return [...cells.values()];
+    return [...this.cells(sessionId).values()].map((cell) => ({
+      chunkKey: cell.chunkKey,
+      chunkX: cell.chunkX,
+      chunkY: cell.chunkY,
+      chunkZ: cell.chunkZ,
+    }));
   }
 
   // Voxel edge length for an LOD level. Level 0 is coarsest; the finest level
@@ -940,8 +1181,10 @@ export class ChunkStore {
   // the 18-byte world-frame point buffer ready to ship, or an empty buffer if the
   // chunk has no data. Works whether the chunk is resident or resting on disk, since
   // both resolve to the same fine representative buffer first.
-  deriveChunkLevel(sessionId: string, chunkKey: string, level: number): Buffer {
-    const fine = this.readFineRepresentatives(sessionId, chunkKey);
+  deriveChunkLevel(sessionId: string, chunkKey: string, level: number, filter?: ObservationFilter): Buffer {
+    const fine = isFilterActive(filter)
+      ? this.readFilteredRepresentatives(sessionId, chunkKey, filter!)
+      : this.readFineRepresentatives(sessionId, chunkKey);
     if (!fine || fine.byteLength === 0) {
       return Buffer.alloc(0);
     }
@@ -949,6 +1192,32 @@ export class ChunkStore {
       return fine; // finest level is the fused grid itself — no coarsening needed
     }
     return serializeRepresentatives(binPoints(fine, this.levelVoxelMeters(level)));
+  }
+
+  // Representatives of the voxels that pass the observation filter. Needs the
+  // accumulators (hits and opportunity baseline), so an on-disk chunk is read from
+  // its .acc sidecar rather than the cheaper .bin.
+  private readFilteredRepresentatives(sessionId: string, chunkKey: string, filter: ObservationFilter): Buffer | null {
+    const cell = this.cells(sessionId).get(chunkKey);
+    if (!cell) {
+      return null;
+    }
+    const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
+    const voxels = active
+      ? active.voxels
+      : this.loadAccumulators(path.join(this.chunksDir, sessionId, `${chunkKey}.acc`), cell.stats, chunkKey)?.voxels;
+    if (!voxels || voxels.size === 0) {
+      return null;
+    }
+    const passing = new Map<string, VoxelAccumulator>();
+    const opportunities = cell.stats.opportunities;
+    for (const [key, acc] of voxels) {
+      const seen = Math.max(1, opportunities - acc.o0 + 1);
+      if (acc.n >= filter.minHits && acc.n / seen >= filter.minRatio) {
+        passing.set(key, acc);
+      }
+    }
+    return passing.size > 0 ? serializeRepresentatives(passing) : null;
   }
 
   // The chunk's fused fine representatives (one 18-byte point per occupied fine voxel):
@@ -997,6 +1266,8 @@ export class ChunkStore {
         batch_count INTEGER NOT NULL,
         bytes INTEGER NOT NULL,
         applied_sequence INTEGER NOT NULL DEFAULT 0,
+        opportunities INTEGER NOT NULL DEFAULT 0,
+        fov_sequence INTEGER NOT NULL DEFAULT 0,
         min_x REAL NOT NULL,
         min_y REAL NOT NULL,
         min_z REAL NOT NULL,
@@ -1011,6 +1282,8 @@ export class ChunkStore {
     // era lacks them.
     this.addColumnIfMissing('sessions', 'checkpoint_offset', 'INTEGER NOT NULL DEFAULT 0');
     this.addColumnIfMissing('chunks', 'applied_sequence', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('chunks', 'opportunities', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('chunks', 'fov_sequence', 'INTEGER NOT NULL DEFAULT 0');
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS batches (
         session_id TEXT NOT NULL,
@@ -1203,6 +1476,7 @@ export class ChunkStore {
       voxels: new Map(),
       pointsSinceFlush: 0,
       appliedSequence: 0,
+      stats: this.registerCell(sessionId, chunkKey, chunkX, chunkY, chunkZ).stats,
     };
     this.seedFromDisk(active);
     this.activeChunks.set(dirtyKey, active);
@@ -1237,29 +1511,55 @@ export class ChunkStore {
         sb: data[o + 14],
         si: data.readUInt16LE(o + 15),
         n: 1,
+        o0: active.stats.opportunities,
       });
     }
   }
 
   private seedAccumulatorsFromDisk(active: ActiveChunk): boolean {
+    const loaded = this.loadAccumulators(active.accumulatorPath, active.stats, active.chunkKey);
+    if (!loaded) {
+      return false;
+    }
+    active.appliedSequence = loaded.appliedSequence;
+    active.voxels = loaded.voxels;
+    return true;
+  }
+
+  // Read an .acc sidecar into accumulators. Version 1 records lack the opportunity
+  // baseline; they are given one that makes their ratio 1 (fully observed).
+  private loadAccumulators(
+    accumulatorPath: string,
+    stats: ChunkStats,
+    chunkKey: string,
+  ): { voxels: Map<string, VoxelAccumulator>; appliedSequence: number } | null {
     let data: Buffer;
     try {
-      data = fs.readFileSync(active.accumulatorPath);
+      data = fs.readFileSync(accumulatorPath);
     } catch (error) {
       if (isNotFoundError(error)) {
-        return false;
+        return null;
       }
       throw error;
     }
     let offset = 0;
+    let appliedSequence = 0;
+    let version = 1;
     if (data.byteLength >= ACCUMULATOR_HEADER_BYTES && data.readUInt32LE(0) === ACCUMULATOR_MAGIC) {
-      active.appliedSequence = data.readDoubleLE(8);
+      version = data.readUInt32LE(4);
+      appliedSequence = data.readDoubleLE(8);
       offset = ACCUMULATOR_HEADER_BYTES;
     }
-    if ((data.byteLength - offset) % ACCUMULATOR_STRIDE_BYTES !== 0) {
-      throw new Error(`Invalid accumulator file length for ${active.chunkKey}`);
+    const stride = version >= 2 ? ACCUMULATOR_STRIDE_BYTES : ACCUMULATOR_V1_STRIDE_BYTES;
+    if ((data.byteLength - offset) % stride !== 0) {
+      throw new Error(`Invalid accumulator file length for ${chunkKey}`);
     }
-    for (; offset < data.byteLength; offset += ACCUMULATOR_STRIDE_BYTES) {
+    const voxels = new Map<string, VoxelAccumulator>();
+    for (; offset < data.byteLength; offset += stride) {
+      const n = data.readDoubleLE(offset + 56);
+      if (n === 0) {
+        throw new Error(`Accumulator with zero samples in ${chunkKey}`);
+      }
       const acc: VoxelAccumulator = {
         sx: data.readDoubleLE(offset),
         sy: data.readDoubleLE(offset + 8),
@@ -1268,17 +1568,12 @@ export class ChunkStore {
         sg: data.readDoubleLE(offset + 32),
         sb: data.readDoubleLE(offset + 40),
         si: data.readDoubleLE(offset + 48),
-        n: data.readDoubleLE(offset + 56),
+        n,
+        o0: version >= 2 ? data.readDoubleLE(offset + 64) : Math.max(0, stats.opportunities - n + 1),
       };
-      if (acc.n === 0) {
-        throw new Error(`Accumulator with zero samples in ${active.chunkKey}`);
-      }
-      active.voxels.set(
-        voxelKey(acc.sx / acc.n, acc.sy / acc.n, acc.sz / acc.n, this.fuseVoxelMeters),
-        acc,
-      );
+      voxels.set(voxelKey(acc.sx / acc.n, acc.sy / acc.n, acc.sz / acc.n, this.fuseVoxelMeters), acc);
     }
-    return true;
+    return { voxels, appliedSequence };
   }
 
   // Overwrite a chunk's files with its current voxel state (atomic replace of both
@@ -1291,6 +1586,7 @@ export class ChunkStore {
     }
 
     const serialized = serializeVoxels(active.voxels, active.appliedSequence);
+    active.stats.dirty = false;
     fs.mkdirSync(path.dirname(active.filePath), { recursive: true });
     writeFileAtomically(active.accumulatorPath, serialized.accumulatorBuffer);
     writeFileAtomically(active.filePath, serialized.buffer);
@@ -1300,15 +1596,17 @@ export class ChunkStore {
       .prepare(
         `INSERT INTO chunks (
           session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
-          point_count, batch_count, bytes, applied_sequence,
+          point_count, batch_count, bytes, applied_sequence, opportunities, fov_sequence,
           min_x, min_y, min_z, max_x, max_y, max_z, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id, chunk_key) DO UPDATE SET
           file_path = excluded.file_path,
           point_count = excluded.point_count,
           batch_count = chunks.batch_count + 1,
           bytes = excluded.bytes,
           applied_sequence = excluded.applied_sequence,
+          opportunities = excluded.opportunities,
+          fov_sequence = excluded.fov_sequence,
           min_x = excluded.min_x,
           min_y = excluded.min_y,
           min_z = excluded.min_z,
@@ -1328,6 +1626,8 @@ export class ChunkStore {
         1,
         serialized.buffer.byteLength,
         active.appliedSequence,
+        active.stats.opportunities,
+        active.stats.fovSequence,
         serialized.minX,
         serialized.minY,
         serialized.minZ,
@@ -1409,6 +1709,7 @@ function serializeVoxels(voxels: Map<string, VoxelAccumulator>, appliedSequence:
     accumulatorBuffer.writeDoubleLE(acc.sb, accumulatorOffset + 40);
     accumulatorBuffer.writeDoubleLE(acc.si, accumulatorOffset + 48);
     accumulatorBuffer.writeDoubleLE(acc.n, accumulatorOffset + 56);
+    accumulatorBuffer.writeDoubleLE(acc.o0, accumulatorOffset + 64);
 
     if (x < minX) minX = x;
     if (y < minY) minY = y;
@@ -1455,7 +1756,7 @@ function binPoints(buffer: Buffer, size: number): Map<string, VoxelAccumulator> 
     const key = voxelKey(x, y, z, size);
     let acc = voxels.get(key);
     if (!acc) {
-      acc = { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0 };
+      acc = { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0, o0: 0 };
       voxels.set(key, acc);
     }
     acc.sx += x;
@@ -1511,6 +1812,14 @@ function syncDirectory(directoryPath: string): void {
   } finally {
     fs.closeSync(descriptor);
   }
+}
+
+function isFilterActive(filter?: ObservationFilter): boolean {
+  return !!filter && (filter.minHits > 1 || filter.minRatio > 0);
+}
+
+function finiteOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
 function removeIfPresent(filePath: string): void {

@@ -23,9 +23,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rate", type=float, default=10.0, help="batches per second")
     parser.add_argument("--yaw-bias", type=float, default=Scenario.yaw_bias_deg_per_step)
     parser.add_argument("--scale-error", type=float, default=Scenario.scale_error)
+    parser.add_argument("--fliers", type=float, default=0.0, help="fraction of one-off artefact points per batch")
+    parser.add_argument(
+        "--azimuth-steps", type=int, default=Scenario.azimuth_steps,
+        help="rays per ring per spin (1800 matches a VLP-16 at 10 Hz; the default 360 is quick)",
+    )
     args = parser.parse_args(argv)
 
-    scenario = Scenario(yaw_bias_deg_per_step=args.yaw_bias, scale_error=args.scale_error)
+    scenario = Scenario(
+        yaw_bias_deg_per_step=args.yaw_bias,
+        scale_error=args.scale_error,
+        flier_fraction=args.fliers,
+        azimuth_steps=args.azimuth_steps,
+    )
     batches, _ = make_batches(scenario)
     with connect(args.server_url, max_size=None) as ws:
         ws.send(
@@ -38,7 +48,10 @@ def main(argv: list[str] | None = None) -> int:
                     "started_at": _now(),
                     "frame_id": "drifted_odom",
                     "units": "meters",
-                    "metadata": {"odometry": "synthetic-drift"},
+                    "metadata": {
+                        "odometry": "synthetic-drift",
+                        "sensor_fov": {"elevation_min_deg": -15, "elevation_max_deg": 15, "max_range_m": 100},
+                    },
                 }
             )
         )
