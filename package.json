@@ -11,7 +11,8 @@
     "client:synthetic": "tsx src/synthetic-publisher.ts",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/src/server.js",
-    "test": "tsx --test test/**/*.test.ts"
+    "test": "tsx --test test/**/*.test.ts",
+    "bench:ingest": "tsx scripts/bench-ingest.ts"
   },
   "engines": {
     "node": ">=22"

@@ -414,16 +414,17 @@ test('listSessionChunkKeys unions resident and persisted cells', () => {
   );
 });
 
-test('recovers a staged batch after session sequence commit without reapplying it', () => {
-  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-transaction-'));
+test('replays a logged batch after a crash before fusion, without reapplying it later', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-log-'));
   let injectCrash = false;
   const sessionStore = new SessionStore();
   const chunkStore = new ChunkStore({
     rootDir,
     chunkSizeMeters: 1,
     fuseVoxelMeters: 0.04,
+    log: () => {},
     durableBatchHook: (phase) => {
-      if (injectCrash && phase === 'session-synced') {
+      if (injectCrash && phase === 'logged') {
         throw new Error('simulated crash');
       }
     },
@@ -431,14 +432,120 @@ test('recovers a staged batch after session sequence commit without reapplying i
   const session = sessionStore.createSession({
     type: 'create_session',
     protocol_version: 1,
-    session_id: 'transaction-session',
-    publisher_id: 'transaction-publisher',
+    session_id: 'log-session',
+    publisher_id: 'log-publisher',
     started_at: '2026-07-10T00:00:00Z',
     frame_id: 'map',
     units: 'meters',
   });
   chunkStore.syncSession(session);
 
+  const storeBatch = (
+    store: ChunkStore,
+    sessions: SessionStore,
+    poseSequence: number,
+    batchSequence: number,
+    xs: number[],
+  ): void => {
+    sessions.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: session.sessionId,
+      publisher_id: session.publisherId,
+      sequence: poseSequence,
+      timestamp: `2026-07-10T00:00:0${poseSequence}Z`,
+      pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    const record = sessions.listSessions()[0];
+    store.syncSession(record);
+    const payload = Buffer.alloc(xs.length * POINT_STRIDE_BYTES);
+    xs.forEach((x, index) => payload.writeFloatLE(x, index * POINT_STRIDE_BYTES));
+    const accepted = sessions.preparePointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: session.sessionId,
+        publisher_id: session.publisherId,
+        sequence: batchSequence,
+        timestamp: `2026-07-10T00:00:0${batchSequence}Z`,
+        pose_sequence: poseSequence,
+        point_count: xs.length,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    store.storeAcceptedBatchDurably(accepted, {
+      ...record,
+      pointBatches: record.pointBatches + 1,
+      totalPoints: record.totalPoints + xs.length,
+      lastSequence: batchSequence,
+      lastSeenAt: accepted.header.timestamp,
+    });
+    sessions.commitPointBatch(accepted);
+  };
+
+  storeBatch(chunkStore, sessionStore, 1, 2, [0, 0.03]);
+  injectCrash = true;
+  // The batch is in the log but was never fused or counted.
+  assert.throws(() => storeBatch(chunkStore, sessionStore, 3, 4, [0.03]), /durably commit batch 4/);
+  chunkStore.close(); // no flush: resident chunks are lost, as in a crash
+
+  const recovered = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  const [restoredSession] = recovered.loadSessions();
+  assert.equal(restoredSession.lastSequence, 4, 'counters caught up from the log');
+  assert.equal(restoredSession.totalPoints, 3);
+  assert.equal(restoredSession.pointBatches, 2);
+  const [world] = recovered.readSessionWorldChunks(session.sessionId);
+  assert.ok(Math.abs(world.readFloatLE(0) - 0.02) < 1e-6, 'both logged batches fused exactly once');
+  const [chunkMeta] = recovered.listSessionChunks(session.sessionId);
+  assert.equal(chunkMeta.appliedSequence, 4, 'recovery checkpointed the replayed chunk');
+  assert.equal(recovered.getSessionLogSummary(session.sessionId).dirtyChunks, 0);
+
+  // A second restart has nothing to replay and must not double-count.
+  recovered.close();
+  const again = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  const [worldAgain] = again.readSessionWorldChunks(session.sessionId);
+  assert.ok(Math.abs(worldAgain.readFloatLE(0) - 0.02) < 1e-6);
+  assert.equal(again.loadSessions()[0].totalPoints, 3);
+
+  const restoredStore = new SessionStore();
+  restoredStore.restoreSessions(again.loadSessions());
+  restoredStore.resumeSession({
+    type: 'resume_session',
+    protocol_version: 1,
+    session_id: session.sessionId,
+    publisher_id: session.publisherId,
+    last_client_sequence: 4,
+  });
+  storeBatch(again, restoredStore, 5, 6, [0.03]);
+  const [afterRestart] = again.readSessionWorldChunks(session.sessionId);
+  assert.ok(Math.abs(afterRestart.readFloatLE(0) - 0.0225) < 1e-6);
+  again.close();
+});
+
+test('replay skips batches a chunk already holds from a partial flush', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-log-partial-'));
+  const sessionStore = new SessionStore();
+  // Threshold 2: the first batch (2 points) persists its chunk immediately with
+  // applied_sequence 2; the second (1 point) stays resident only.
+  const chunkStore = new ChunkStore({
+    rootDir,
+    chunkSizeMeters: 1,
+    fuseVoxelMeters: 0.04,
+    flushPointThreshold: 2,
+    log: () => {},
+  });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'partial-session',
+    publisher_id: 'partial-publisher',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
   const storeBatch = (poseSequence: number, batchSequence: number, xs: number[]): void => {
     sessionStore.applyPoseUpdate({
       type: 'pose_update',
@@ -448,7 +555,6 @@ test('recovers a staged batch after session sequence commit without reapplying i
       timestamp: `2026-07-10T00:00:0${poseSequence}Z`,
       pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
     });
-    chunkStore.syncSession(session);
     const payload = Buffer.alloc(xs.length * POINT_STRIDE_BYTES);
     xs.forEach((x, index) => payload.writeFloatLE(x, index * POINT_STRIDE_BYTES));
     const accepted = sessionStore.preparePointBatch(
@@ -478,46 +584,54 @@ test('recovers a staged batch after session sequence commit without reapplying i
   };
 
   storeBatch(1, 2, [0, 0.03]);
-  injectCrash = true;
-  assert.throws(() => storeBatch(3, 4, [0.03]), /durably commit batch 4/);
-  chunkStore.close();
+  storeBatch(3, 4, [0.03]);
+  assert.equal(chunkStore.listSessionChunks(session.sessionId)[0].appliedSequence, 2);
+  assert.equal(chunkStore.getSessionLogSummary(session.sessionId).checkpointOffset, 0, 'no checkpoint yet');
+  chunkStore.close(); // crash: no checkpoint, so replay starts at offset 0
 
-  const recovered = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04 });
-  const [restoredSession] = recovered.loadSessions();
-  assert.equal(restoredSession.lastSequence, 4);
-  assert.equal(restoredSession.totalPoints, 3);
+  const recovered = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
   const [world] = recovered.readSessionWorldChunks(session.sessionId);
-  assert.ok(Math.abs(world.readFloatLE(0) - 0.02) < 1e-6);
+  // Mean of {0, 0.03, 0.03} is 0.02; reapplying batch 2 would give 0.018.
+  assert.ok(Math.abs(world.readFloatLE(0) - 0.02) < 1e-6, 'batch 2 skipped, batch 4 applied');
+  const summary = recovered.getSessionLogSummary(session.sessionId);
+  assert.equal(summary.checkpointOffset, summary.logBytes, 'recovery checkpointed to the log end');
+  recovered.close();
+});
 
-  const restoredStore = new SessionStore();
-  restoredStore.restoreSessions(recovered.loadSessions());
-  const restoredRecord = restoredStore.resumeSession({
-    type: 'resume_session',
+test('checkpoint sweep advances only once every snapshot-era dirty chunk is persisted', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-sweep-'));
+  const sessionStore = new SessionStore();
+  const chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  const session = sessionStore.createSession({
+    type: 'create_session',
     protocol_version: 1,
-    session_id: session.sessionId,
-    publisher_id: session.publisherId,
-    last_client_sequence: 4,
+    session_id: 'sweep-session',
+    publisher_id: 'sweep-publisher',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
   });
-  restoredStore.applyPoseUpdate({
+  chunkStore.syncSession(session);
+  sessionStore.applyPoseUpdate({
     type: 'pose_update',
     session_id: session.sessionId,
     publisher_id: session.publisherId,
-    sequence: 5,
-    timestamp: '2026-07-10T00:00:05Z',
+    sequence: 1,
+    timestamp: '2026-07-10T00:00:01Z',
     pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
   });
-  recovered.syncSession(restoredRecord);
-  const payload = Buffer.alloc(POINT_STRIDE_BYTES);
-  payload.writeFloatLE(0.03, 0);
-  const accepted = restoredStore.preparePointBatch(
+  // Three points in three different 1 m chunks.
+  const payload = Buffer.alloc(3 * POINT_STRIDE_BYTES);
+  [0.5, 1.5, 2.5].forEach((x, index) => payload.writeFloatLE(x, index * POINT_STRIDE_BYTES));
+  const accepted = sessionStore.preparePointBatch(
     {
       type: 'point_batch_header',
       session_id: session.sessionId,
       publisher_id: session.publisherId,
-      sequence: 6,
-      timestamp: '2026-07-10T00:00:06Z',
-      pose_sequence: 5,
-      point_count: 1,
+      sequence: 2,
+      timestamp: '2026-07-10T00:00:02Z',
+      pose_sequence: 1,
+      point_count: 3,
       point_format: POINT_FORMAT,
       encoding: 'binary_le',
       compression: 'none',
@@ -525,17 +639,22 @@ test('recovers a staged batch after session sequence commit without reapplying i
     },
     payload,
   );
-  recovered.storeAcceptedBatchDurably(accepted, {
-    ...restoredRecord,
-    pointBatches: restoredRecord.pointBatches + 1,
-    totalPoints: restoredRecord.totalPoints + 1,
-    lastSequence: 6,
-    lastSeenAt: accepted.header.timestamp,
-  });
-  restoredStore.commitPointBatch(accepted);
-  const [afterRestart] = recovered.readSessionWorldChunks(session.sessionId);
-  assert.ok(Math.abs(afterRestart.readFloatLE(0) - 0.0225) < 1e-6);
-  recovered.close();
+  chunkStore.storeAcceptedBatchDurably(accepted, { ...session, lastSequence: 2, totalPoints: 3, pointBatches: 1 });
+  sessionStore.commitPointBatch(accepted);
+
+  assert.equal(chunkStore.getSessionLogSummary(session.sessionId).dirtyChunks, 3);
+  assert.equal(chunkStore.checkpointSession(session.sessionId, 1), false);
+  let summary = chunkStore.getSessionLogSummary(session.sessionId);
+  assert.equal(summary.dirtyChunks, 2);
+  assert.equal(summary.sweepPending, 2);
+  assert.equal(summary.checkpointOffset, 0, 'sweep incomplete: checkpoint unchanged');
+  assert.equal(chunkStore.checkpointSession(session.sessionId, 1), false);
+  assert.equal(chunkStore.checkpointSession(session.sessionId, 1), true);
+  summary = chunkStore.getSessionLogSummary(session.sessionId);
+  assert.equal(summary.dirtyChunks, 0);
+  assert.equal(summary.checkpointOffset, summary.logBytes);
+  assert.ok(summary.logBytes > 0);
+  chunkStore.close();
 });
 
 test('rejects excessive chunk fan-out before mutating the store', () => {

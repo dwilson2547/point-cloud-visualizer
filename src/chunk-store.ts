@@ -6,8 +6,15 @@ import {
   type AcceptedBatch,
   type SessionSnapshot,
 } from './session-store.js';
-import { POINT_STRIDE_BYTES } from './protocol.js';
+import { POINT_STRIDE_BYTES, type Pose } from './protocol.js';
+import { BatchLogWriter, replayLog, type LogRecordHeader } from './batch-log.js';
 
+// Accumulator sidecar (.acc): a 16-byte header then one 64-byte record per voxel.
+//   u32 magic 'PCVA', u32 version, f64 applied_sequence (last batch fused into it)
+// A headerless file (pre-log layout) is read as applied_sequence 0.
+const ACCUMULATOR_MAGIC = 0x41564350;
+const ACCUMULATOR_VERSION = 1;
+const ACCUMULATOR_HEADER_BYTES = 16;
 const ACCUMULATOR_STRIDE_BYTES = 64;
 
 export interface ChunkStoreOptions {
@@ -18,7 +25,10 @@ export interface ChunkStoreOptions {
   flushPointThreshold?: number;
   maxDirtyChunks?: number;
   maxChunksPerBatch?: number;
-  durableBatchHook?: (phase: 'staged' | 'session-synced') => void;
+  // Test seam: called after the batch is durable in the log and again after it has
+  // been fused and the session row updated.
+  durableBatchHook?: (phase: 'logged' | 'fused') => void;
+  log?: (message: string) => void;
 }
 
 export interface ChunkMetadata {
@@ -31,6 +41,7 @@ export interface ChunkMetadata {
   pointCount: number;
   batchCount: number;
   bytes: number;
+  appliedSequence: number;
   minX: number;
   minY: number;
   minZ: number;
@@ -51,6 +62,7 @@ export interface StorageSummary {
   persistedSessions: number;
   persistedChunks: number;
   persistedBytes: number;
+  logBytes: number;
 }
 
 export class DurableBatchError extends Error {
@@ -77,7 +89,8 @@ interface VoxelAccumulator {
 // A chunk resident in memory: its full current voxel set (seeded from disk on
 // activation, so it is a superset of the on-disk file). Stays resident across
 // periodic flushes and is released (persisted + dropped) only on eviction or an
-// explicit flush.
+// explicit flush. `appliedSequence` is the highest batch sequence fused into it; it
+// travels with the file so log replay can skip batches a chunk already holds.
 interface ActiveChunk {
   sessionId: string;
   chunkKey: string;
@@ -88,6 +101,7 @@ interface ActiveChunk {
   accumulatorPath: string;
   voxels: Map<string, VoxelAccumulator>;
   pointsSinceFlush: number;
+  appliedSequence: number;
 }
 
 interface SerializedVoxels {
@@ -101,31 +115,21 @@ interface SerializedVoxels {
   maxZ: number;
 }
 
-interface StagedChunk {
-  chunkKey: string;
-  chunkX: number;
-  chunkY: number;
-  chunkZ: number;
-  stagedFile: string;
-  finalFile: string;
-  stagedAccumulatorFile: string;
-  finalAccumulatorFile: string;
-  pointCount: number;
-  batchCount: number;
-  bytes: number;
-  minX: number;
-  minY: number;
-  minZ: number;
-  maxX: number;
-  maxY: number;
-  maxZ: number;
-  updatedAt: string;
+interface SessionLogState {
+  writer?: BatchLogWriter;
+  endOffset: number; // bytes of intact records in the log
+  checkpointOffset: number; // replay start: everything before is in persisted chunks
+  // An in-progress checkpoint sweep: the log end when it started and the chunks that
+  // were dirty then. Once all of them have been persisted, everything logged before
+  // `offset` is on disk in chunk form and the checkpoint can move there.
+  sweep?: { offset: number; pending: string[] };
 }
 
-interface BatchTransactionManifest {
-  sessionId: string;
-  sequence: number;
-  chunks: StagedChunk[];
+export interface SessionLogSummary {
+  logBytes: number;
+  checkpointOffset: number;
+  dirtyChunks: number;
+  sweepPending: number;
 }
 
 export class ChunkStore {
@@ -138,17 +142,19 @@ export class ChunkStore {
 
   private readonly rootDir: string;
   private readonly chunksDir: string;
-  private readonly transactionsDir: string;
+  private readonly logsDir: string;
   private readonly database: DatabaseSync;
-  private readonly durableBatchHook?: (phase: 'staged' | 'session-synced') => void;
+  private readonly durableBatchHook?: (phase: 'logged' | 'fused') => void;
+  private readonly log: (message: string) => void;
   // Chunks currently resident in memory, keyed `sessionId:chunkKey`. Insertion
   // order is the LRU order used for eviction.
   private readonly activeChunks = new Map<string, ActiveChunk>();
+  private readonly sessionLogs = new Map<string, SessionLogState>();
 
   constructor(options: ChunkStoreOptions) {
     this.rootDir = options.rootDir;
     this.chunksDir = path.join(this.rootDir, 'chunks');
-    this.transactionsDir = path.join(this.rootDir, 'transactions');
+    this.logsDir = path.join(this.rootDir, 'log');
     this.chunkSizeMeters = options.chunkSizeMeters ?? 2;
     this.fuseVoxelMeters = options.fuseVoxelMeters ?? 0.04;
     this.numLevels = Math.max(1, options.numLevels ?? 6);
@@ -156,12 +162,17 @@ export class ChunkStore {
     this.maxDirtyChunks = options.maxDirtyChunks ?? 128;
     this.maxChunksPerBatch = options.maxChunksPerBatch ?? 128;
     this.durableBatchHook = options.durableBatchHook;
+    this.log = options.log ?? ((message) => console.log(message));
 
     fs.mkdirSync(this.chunksDir, { recursive: true });
-    fs.mkdirSync(this.transactionsDir, { recursive: true });
+    fs.mkdirSync(this.logsDir, { recursive: true });
     this.database = new DatabaseSync(path.join(this.rootDir, 'metadata.sqlite'));
+    // WAL + NORMAL: a commit is a WAL append without an fsync. Batches are made
+    // durable by the batch log, and everything in SQLite is rebuilt from it plus the
+    // chunk files, so the metadata store does not need to pay for its own fsyncs.
+    this.database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
     this.initializeSchema();
-    this.recoverBatchTransactions();
+    this.recoverLogs();
   }
 
   syncSession(session: SessionSnapshot): void {
@@ -227,55 +238,78 @@ export class ChunkStore {
       }));
   }
 
-  // Transform a batch's local-frame points into the world frame and fuse them into
-  // per-chunk voxel grids. Density is bounded by occupied voxels, not by measurement
-  // count, so re-observing a surface adds no points once its voxels are filled. Returns
-  // the chunk keys this batch touched, so callers can refresh those chunks for viewers.
+  // Fuse a batch into the resident chunk cache without logging it. For tests and
+  // tooling; the server always goes through storeAcceptedBatchDurably.
   storeAcceptedBatch(accepted: AcceptedBatch): string[] {
     this.collectBatchChunkKeys(accepted);
-    return this.fuseAcceptedBatch(accepted, true);
+    return this.fuseBatch(
+      accepted.session.sessionId,
+      accepted.header.sequence,
+      accepted.pose.pose,
+      accepted.payload,
+      true,
+    );
   }
 
+  // The durable ingest path: append the raw batch to the session log (one write,
+  // one fsync), then fuse it into the chunk cache and record the session counters.
+  // Once this returns the batch survives a crash — anything not yet reflected in
+  // persisted chunk files is replayed from the log at the next startup. Returns the
+  // chunk keys the batch touched so callers can refresh them for viewers.
   storeAcceptedBatchDurably(accepted: AcceptedBatch, nextSession: SessionSnapshot): string[] {
+    const sessionId = accepted.session.sessionId;
     const batchChunkKeys = this.collectBatchChunkKeys(accepted);
     if (batchChunkKeys.size > this.maxDirtyChunks) {
       throw new Error(
         `Batch touches ${batchChunkKeys.size} chunks but the resident chunk budget is ${this.maxDirtyChunks}`,
       );
     }
-    this.prepareActiveCapacity(accepted.session.sessionId, batchChunkKeys);
     try {
-      const touchedKeys = this.fuseAcceptedBatch(accepted, false);
-      const manifest = this.stageBatchTransaction(
-        accepted.session.sessionId,
+      const state = this.sessionLog(sessionId);
+      const writer = state.writer ?? (state.writer = new BatchLogWriter(this.logPath(sessionId)));
+      const record: LogRecordHeader = {
+        sequence: accepted.header.sequence,
+        pose_sequence: accepted.header.pose_sequence,
+        timestamp: accepted.header.timestamp,
+        point_count: accepted.header.point_count,
+        pose: accepted.pose.pose,
+      };
+      state.endOffset = writer.append(record, accepted.payload);
+      this.durableBatchHook?.('logged');
+
+      this.prepareActiveCapacity(sessionId, batchChunkKeys);
+      const touchedKeys = this.fuseBatch(
+        sessionId,
         accepted.header.sequence,
-        touchedKeys,
+        accepted.pose.pose,
+        accepted.payload,
+        true,
       );
-      this.durableBatchHook?.('staged');
       this.syncSession(nextSession);
-      this.durableBatchHook?.('session-synced');
-      this.finalizeBatchTransaction(manifest);
-      for (const chunkKey of touchedKeys) {
-        const active = this.activeChunks.get(`${accepted.session.sessionId}:${chunkKey}`);
-        if (active) {
-          active.pointsSinceFlush = 0;
-        }
-      }
-      this.enforceActiveLimit();
+      this.durableBatchHook?.('fused');
       return touchedKeys;
     } catch (error) {
       throw new DurableBatchError(
-        `Failed to durably commit batch ${accepted.header.sequence} for ${accepted.session.sessionId}`,
+        `Failed to durably commit batch ${accepted.header.sequence} for ${sessionId}`,
         { cause: error },
       );
     }
   }
 
-  private fuseAcceptedBatch(accepted: AcceptedBatch, allowPersistence: boolean): string[] {
-    const payload = accepted.payload;
-    const sessionId = accepted.session.sessionId;
-    const [tx, ty, tz] = accepted.pose.pose.translation_m;
-    const [qx, qy, qz, qw] = accepted.pose.pose.rotation_xyzw;
+  // Transform a batch's local-frame points into the world frame and fuse them into
+  // per-chunk voxel grids. Density is bounded by occupied voxels, not by measurement
+  // count, so re-observing a surface adds no points once its voxels are filled. A
+  // chunk that already holds this sequence (a replayed batch after a partial flush)
+  // is left untouched, which is what makes log replay idempotent.
+  private fuseBatch(
+    sessionId: string,
+    sequence: number,
+    pose: Pose,
+    payload: Buffer,
+    allowPersistence: boolean,
+  ): string[] {
+    const [tx, ty, tz] = pose.translation_m;
+    const [qx, qy, qz, qw] = pose.rotation_xyzw;
     const chunkSize = this.chunkSizeMeters;
     const voxelSize = this.fuseVoxelMeters;
 
@@ -302,6 +336,9 @@ export class ChunkStore {
       const chunkY = Math.floor(worldY / chunkSize);
       const chunkZ = Math.floor(worldZ / chunkSize);
       const active = this.activateChunk(sessionId, chunkX, chunkY, chunkZ);
+      if (active.appliedSequence >= sequence) {
+        continue; // already fused into this chunk before a crash
+      }
 
       const key = voxelKey(worldX, worldY, worldZ, voxelSize);
       let acc = active.voxels.get(key);
@@ -325,6 +362,7 @@ export class ChunkStore {
     // Refresh LRU order for touched chunks and persist any that crossed the flush
     // cadence (kept resident afterwards so fusion continues in place).
     for (const active of touched) {
+      active.appliedSequence = sequence;
       const dirtyKey = `${active.sessionId}:${active.chunkKey}`;
       this.activeChunks.delete(dirtyKey);
       this.activeChunks.set(dirtyKey, active);
@@ -344,22 +382,121 @@ export class ChunkStore {
     return touchedKeys;
   }
 
+  // Advance a session's replay start. A sweep snapshots the log end and the set of
+  // dirty resident chunks, persists those chunks (keeping them resident) and, once
+  // none of the snapshot remains dirty, moves the checkpoint to the snapshot offset.
+  // Chunks dirtied again after the snapshot are covered by later log records, and a
+  // chunk persisted with data past the snapshot skips those records on replay via
+  // its applied sequence. `maxChunks` bounds how many chunks one call rewrites so a
+  // periodic tick never stalls ingest for a full cache rewrite; Infinity finishes the
+  // sweep in one go. Returns true when the checkpoint is fully up to date.
+  checkpointSession(sessionId: string, maxChunks: number = Number.POSITIVE_INFINITY): boolean {
+    const state = this.sessionLog(sessionId);
+    if (!state.sweep) {
+      if (state.endOffset === state.checkpointOffset && this.dirtyChunkKeys(sessionId).length === 0) {
+        return true;
+      }
+      state.sweep = { offset: state.endOffset, pending: this.dirtyChunkKeys(sessionId) };
+    }
+    const { sweep } = state;
+    let persisted = 0;
+    while (sweep.pending.length > 0 && persisted < maxChunks) {
+      const chunkKey = sweep.pending.pop()!;
+      const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
+      // Evicted since the snapshot (persisted on the way out) or flushed by the
+      // threshold path: either way its snapshot-era data is already on disk.
+      if (active && active.pointsSinceFlush > 0) {
+        this.persistChunk(active);
+        persisted += 1;
+      }
+    }
+    if (sweep.pending.length > 0) {
+      return false;
+    }
+    state.sweep = undefined;
+    if (sweep.offset !== state.checkpointOffset) {
+      state.checkpointOffset = sweep.offset;
+      this.database
+        .prepare('UPDATE sessions SET checkpoint_offset = ? WHERE session_id = ?')
+        .run(state.checkpointOffset, sessionId);
+    }
+    return state.endOffset === state.checkpointOffset;
+  }
+
+  // One periodic step of checkpointing across every session, rewriting at most
+  // `maxChunks` chunk files in total.
+  checkpointTick(maxChunks: number): void {
+    let budget = maxChunks;
+    for (const sessionId of this.sessionLogs.keys()) {
+      if (budget <= 0) {
+        return;
+      }
+      const before = this.dirtyChunkKeys(sessionId).length;
+      this.checkpointSession(sessionId, budget);
+      budget -= Math.max(0, before - this.dirtyChunkKeys(sessionId).length);
+    }
+  }
+
+  checkpointAll(): void {
+    for (const sessionId of this.sessionLogs.keys()) {
+      this.checkpointSession(sessionId);
+    }
+  }
+
+  getSessionLogSummary(sessionId: string): SessionLogSummary {
+    const state = this.sessionLogs.get(sessionId);
+    return {
+      logBytes: state?.endOffset ?? 0,
+      checkpointOffset: state?.checkpointOffset ?? 0,
+      dirtyChunks: this.dirtyChunkKeys(sessionId).length,
+      sweepPending: state?.sweep?.pending.length ?? 0,
+    };
+  }
+
+  private dirtyChunkKeys(sessionId: string): string[] {
+    const prefix = `${sessionId}:`;
+    const keys: string[] = [];
+    for (const [key, active] of this.activeChunks) {
+      if (key.startsWith(prefix) && active.pointsSinceFlush > 0) {
+        keys.push(active.chunkKey);
+      }
+    }
+    return keys;
+  }
+
+  // Checkpoint a session and release its resident chunks and log handle (session
+  // closed or server shutting down). Re-touching it later re-seeds from disk.
   flushSession(sessionId: string): void {
+    this.checkpointSession(sessionId);
     const prefix = `${sessionId}:`;
     for (const key of [...this.activeChunks.keys()]) {
       if (key.startsWith(prefix)) {
         this.evictChunk(key);
       }
     }
+    const state = this.sessionLogs.get(sessionId);
+    if (state?.writer) {
+      state.writer.close();
+      state.writer = undefined;
+    }
   }
 
   flushAll(): void {
+    this.checkpointAll();
     for (const key of [...this.activeChunks.keys()]) {
       this.evictChunk(key);
+    }
+    for (const state of this.sessionLogs.values()) {
+      state.writer?.close();
+      state.writer = undefined;
     }
   }
 
   close(): void {
+    for (const state of this.sessionLogs.values()) {
+      state.writer?.close();
+      state.writer = undefined;
+    }
     this.database.close();
   }
 
@@ -377,6 +514,11 @@ export class ChunkStore {
       persisted_bytes: number;
     };
 
+    let logBytes = 0;
+    for (const state of this.sessionLogs.values()) {
+      logBytes += state.endOffset;
+    }
+
     return {
       chunkSizeMeters: this.chunkSizeMeters,
       fuseVoxelMeters: this.fuseVoxelMeters,
@@ -388,6 +530,7 @@ export class ChunkStore {
       persistedSessions: counts.persisted_sessions,
       persistedChunks: counts.persisted_chunks,
       persistedBytes: counts.persisted_bytes,
+      logBytes,
     };
   }
 
@@ -396,7 +539,7 @@ export class ChunkStore {
       .prepare(
         `SELECT
           session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
-          point_count, batch_count, bytes,
+          point_count, batch_count, bytes, applied_sequence,
           min_x, min_y, min_z, max_x, max_y, max_z, updated_at
         FROM chunks
         WHERE session_id = ?
@@ -413,6 +556,7 @@ export class ChunkStore {
         pointCount: Number(row.point_count),
         batchCount: Number(row.batch_count),
         bytes: Number(row.bytes),
+        appliedSequence: Number(row.applied_sequence),
         minX: Number(row.min_x),
         minY: Number(row.min_y),
         minZ: Number(row.min_z),
@@ -440,7 +584,7 @@ export class ChunkStore {
       if (!key.startsWith(prefix) || active.voxels.size === 0) {
         continue;
       }
-      yield this.serializeVoxels(active.voxels).buffer;
+      yield serializeRepresentatives(active.voxels);
       emitted.add(active.chunkKey);
     }
 
@@ -459,7 +603,6 @@ export class ChunkStore {
         }
       }
     }
-
   }
 
   // All chunk cells for a session (resident + persisted, deduped). Chunk metadata only
@@ -516,7 +659,7 @@ export class ChunkStore {
     if (level >= this.numLevels - 1) {
       return fine; // finest level is the fused grid itself — no coarsening needed
     }
-    return this.serializeVoxels(binPoints(fine, this.levelVoxelMeters(level))).buffer;
+    return serializeRepresentatives(binPoints(fine, this.levelVoxelMeters(level)));
   }
 
   // The chunk's fused fine representatives (one 18-byte point per occupied fine voxel):
@@ -524,7 +667,7 @@ export class ChunkStore {
   private readFineRepresentatives(sessionId: string, chunkKey: string): Buffer | null {
     const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
     if (active) {
-      return active.voxels.size > 0 ? this.serializeVoxels(active.voxels).buffer : null;
+      return active.voxels.size > 0 ? serializeRepresentatives(active.voxels) : null;
     }
     try {
       return fs.readFileSync(path.join(this.chunksDir, sessionId, `${chunkKey}.bin`));
@@ -550,7 +693,8 @@ export class ChunkStore {
         total_points INTEGER NOT NULL,
         point_batches INTEGER NOT NULL,
         last_sequence INTEGER NOT NULL,
-        last_pose_sequence INTEGER
+        last_pose_sequence INTEGER,
+        checkpoint_offset INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS chunks (
@@ -563,6 +707,7 @@ export class ChunkStore {
         point_count INTEGER NOT NULL,
         batch_count INTEGER NOT NULL,
         bytes INTEGER NOT NULL,
+        applied_sequence INTEGER NOT NULL DEFAULT 0,
         min_x REAL NOT NULL,
         min_y REAL NOT NULL,
         min_z REAL NOT NULL,
@@ -573,6 +718,85 @@ export class ChunkStore {
         PRIMARY KEY (session_id, chunk_key)
       );
     `);
+    // Columns added after the first schema shipped; a data dir from the transaction
+    // era lacks them.
+    this.addColumnIfMissing('sessions', 'checkpoint_offset', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('chunks', 'applied_sequence', 'INTEGER NOT NULL DEFAULT 0');
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const columns = this.database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some((entry) => entry.name === column)) {
+      this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  // Startup: replay each session's log from its checkpoint offset into the chunk
+  // cache, bring the session counters up to the log, then checkpoint so the next
+  // start has nothing to redo. Chunks that already hold a replayed sequence skip it.
+  private recoverLogs(): void {
+    const rows = this.database
+      .prepare('SELECT session_id, last_sequence, total_points, point_batches, checkpoint_offset FROM sessions')
+      .all() as Array<{
+      session_id: string;
+      last_sequence: number;
+      total_points: number;
+      point_batches: number;
+      checkpoint_offset: number;
+    }>;
+    const known = new Set<string>();
+
+    for (const row of rows) {
+      const sessionId = String(row.session_id);
+      known.add(sessionId);
+      const logPath = this.logPath(sessionId);
+      const state = this.sessionLog(sessionId);
+      state.checkpointOffset = Number(row.checkpoint_offset);
+      let lastSequence = Number(row.last_sequence);
+      let totalPoints = Number(row.total_points);
+      let pointBatches = Number(row.point_batches);
+      let lastSeenAt: string | undefined;
+
+      const result = replayLog(logPath, state.checkpointOffset, (record) => {
+        const { header, payload } = record;
+        this.fuseBatch(sessionId, header.sequence, header.pose, payload, true);
+        if (header.sequence > lastSequence) {
+          // Counters in SQLite lag the log (they are only written after the fuse), so
+          // records past the persisted sequence were never counted.
+          lastSequence = header.sequence;
+          totalPoints += header.point_count;
+          pointBatches += 1;
+          lastSeenAt = header.timestamp;
+        }
+      });
+      state.endOffset = result.endOffset;
+      if (state.checkpointOffset > state.endOffset) {
+        state.checkpointOffset = state.endOffset;
+      }
+      if (result.records > 0 || result.truncatedBytes > 0) {
+        this.log(
+          `Replayed ${result.records} logged batches for ${sessionId}` +
+            (result.truncatedBytes > 0 ? ` (dropped ${result.truncatedBytes} torn tail bytes)` : ''),
+        );
+      }
+      if (lastSequence !== Number(row.last_sequence)) {
+        this.database
+          .prepare(
+            `UPDATE sessions
+             SET last_sequence = ?, total_points = ?, point_batches = ?,
+                 last_seen_at = COALESCE(?, last_seen_at)
+             WHERE session_id = ?`,
+          )
+          .run(lastSequence, totalPoints, pointBatches, lastSeenAt ?? null, sessionId);
+      }
+      this.checkpointSession(sessionId);
+    }
+
+    for (const entry of listLogFiles(this.logsDir)) {
+      if (!known.has(entry)) {
+        this.log(`Batch log for unknown session ${entry} left untouched`);
+      }
+    }
   }
 
   private collectBatchChunkKeys(accepted: AcceptedBatch): Set<string> {
@@ -629,148 +853,17 @@ export class ChunkStore {
     }
   }
 
-  private stageBatchTransaction(
-    sessionId: string,
-    sequence: number,
-    touchedKeys: string[],
-  ): BatchTransactionManifest {
-    const transactionDir = path.join(this.transactionsDir, sessionId, String(sequence));
-    fs.mkdirSync(transactionDir, { recursive: true });
-    const chunks: StagedChunk[] = [];
-
-    for (const chunkKey of touchedKeys) {
-      const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
-      if (!active || active.voxels.size === 0) {
-        continue;
-      }
-      const serialized = this.serializeVoxels(active.voxels);
-      const stagedPath = path.join(transactionDir, `${chunkKey}.bin`);
-      const stagedAccumulatorPath = path.join(transactionDir, `${chunkKey}.acc`);
-      writeFileAtomically(stagedPath, serialized.buffer);
-      writeFileAtomically(stagedAccumulatorPath, serialized.accumulatorBuffer);
-      const previous = this.database
-        .prepare('SELECT batch_count FROM chunks WHERE session_id = ? AND chunk_key = ?')
-        .get(sessionId, chunkKey) as { batch_count?: number } | undefined;
-      chunks.push({
-        chunkKey,
-        chunkX: active.chunkX,
-        chunkY: active.chunkY,
-        chunkZ: active.chunkZ,
-        stagedFile: path.relative(this.rootDir, stagedPath),
-        finalFile: path.relative(this.rootDir, active.filePath),
-        stagedAccumulatorFile: path.relative(this.rootDir, stagedAccumulatorPath),
-        finalAccumulatorFile: path.relative(this.rootDir, active.accumulatorPath),
-        pointCount: active.voxels.size,
-        batchCount: Number(previous?.batch_count ?? 0) + 1,
-        bytes: serialized.buffer.byteLength,
-        minX: serialized.minX,
-        minY: serialized.minY,
-        minZ: serialized.minZ,
-        maxX: serialized.maxX,
-        maxY: serialized.maxY,
-        maxZ: serialized.maxZ,
-        updatedAt: new Date().toISOString(),
-      });
+  private sessionLog(sessionId: string): SessionLogState {
+    let state = this.sessionLogs.get(sessionId);
+    if (!state) {
+      state = { endOffset: 0, checkpointOffset: 0 };
+      this.sessionLogs.set(sessionId, state);
     }
-
-    const manifest: BatchTransactionManifest = { sessionId, sequence, chunks };
-    writeFileAtomically(
-      path.join(transactionDir, 'manifest.json'),
-      Buffer.from(JSON.stringify(manifest)),
-    );
-    return manifest;
+    return state;
   }
 
-  private recoverBatchTransactions(): void {
-    for (const sessionEntry of readDirectories(this.transactionsDir)) {
-      const sessionDir = path.join(this.transactionsDir, sessionEntry);
-      const sequenceEntries = readDirectories(sessionDir).sort((a, b) => Number(a) - Number(b));
-      for (const sequenceEntry of sequenceEntries) {
-        const transactionDir = path.join(sessionDir, sequenceEntry);
-        const manifestPath = path.join(transactionDir, 'manifest.json');
-        let manifest: BatchTransactionManifest;
-        try {
-          manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as BatchTransactionManifest;
-        } catch (error) {
-          if (isNotFoundError(error)) {
-            fs.rmSync(transactionDir, { recursive: true, force: true });
-            continue;
-          }
-          throw error;
-        }
-        const persisted = this.database
-          .prepare('SELECT last_sequence FROM sessions WHERE session_id = ?')
-          .get(manifest.sessionId) as { last_sequence?: number } | undefined;
-        if (Number(persisted?.last_sequence ?? -1) >= manifest.sequence) {
-          this.finalizeBatchTransaction(manifest);
-        } else {
-          fs.rmSync(transactionDir, { recursive: true, force: true });
-        }
-      }
-      removeDirectoryIfEmpty(sessionDir);
-    }
-  }
-
-  private finalizeBatchTransaction(manifest: BatchTransactionManifest): void {
-    for (const chunk of manifest.chunks) {
-      const stagedPath = path.join(this.rootDir, chunk.stagedFile);
-      const finalPath = path.join(this.rootDir, chunk.finalFile);
-      const stagedAccumulatorPath = path.join(this.rootDir, chunk.stagedAccumulatorFile);
-      const finalAccumulatorPath = path.join(this.rootDir, chunk.finalAccumulatorFile);
-      fs.mkdirSync(path.dirname(finalPath), { recursive: true });
-      finalizeStagedFile(stagedAccumulatorPath, finalAccumulatorPath, chunk.chunkKey);
-      finalizeStagedFile(stagedPath, finalPath, chunk.chunkKey);
-      this.upsertChunkMetadata(manifest.sessionId, chunk);
-    }
-
-    const transactionDir = path.join(
-      this.transactionsDir,
-      manifest.sessionId,
-      String(manifest.sequence),
-    );
-    fs.rmSync(transactionDir, { recursive: true, force: true });
-    removeDirectoryIfEmpty(path.dirname(transactionDir));
-  }
-
-  private upsertChunkMetadata(sessionId: string, chunk: StagedChunk): void {
-    this.database
-      .prepare(
-        `INSERT INTO chunks (
-          session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
-          point_count, batch_count, bytes,
-          min_x, min_y, min_z, max_x, max_y, max_z, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(session_id, chunk_key) DO UPDATE SET
-          file_path = excluded.file_path,
-          point_count = excluded.point_count,
-          batch_count = excluded.batch_count,
-          bytes = excluded.bytes,
-          min_x = excluded.min_x,
-          min_y = excluded.min_y,
-          min_z = excluded.min_z,
-          max_x = excluded.max_x,
-          max_y = excluded.max_y,
-          max_z = excluded.max_z,
-          updated_at = excluded.updated_at`,
-      )
-      .run(
-        sessionId,
-        chunk.chunkKey,
-        chunk.chunkX,
-        chunk.chunkY,
-        chunk.chunkZ,
-        chunk.finalFile,
-        chunk.pointCount,
-        chunk.batchCount,
-        chunk.bytes,
-        chunk.minX,
-        chunk.minY,
-        chunk.minZ,
-        chunk.maxX,
-        chunk.maxY,
-        chunk.maxZ,
-        chunk.updatedAt,
-      );
+  private logPath(sessionId: string): string {
+    return path.join(this.logsDir, `${sessionId}.log`);
   }
 
   // Return the resident chunk for a cell, creating it (and seeding it from any
@@ -798,14 +891,15 @@ export class ChunkStore {
       accumulatorPath: path.join(this.chunksDir, sessionId, `${chunkKey}.acc`),
       voxels: new Map(),
       pointsSinceFlush: 0,
+      appliedSequence: 0,
     };
     this.seedFromDisk(active);
     this.activeChunks.set(dirtyKey, active);
     return active;
   }
 
-  // Load a previously-flushed chunk file back into voxel accumulators. The file is
-  // already one representative per voxel, so each seeds a fresh accumulator at n=1.
+  // Load a previously-flushed chunk back into voxel accumulators: exact sums from the
+  // .acc sidecar when present, else representatives from the .bin at n=1 each.
   private seedFromDisk(active: ActiveChunk): void {
     if (this.seedAccumulatorsFromDisk(active)) {
       return;
@@ -846,10 +940,15 @@ export class ChunkStore {
       }
       throw error;
     }
-    if (data.byteLength % ACCUMULATOR_STRIDE_BYTES !== 0) {
+    let offset = 0;
+    if (data.byteLength >= ACCUMULATOR_HEADER_BYTES && data.readUInt32LE(0) === ACCUMULATOR_MAGIC) {
+      active.appliedSequence = data.readDoubleLE(8);
+      offset = ACCUMULATOR_HEADER_BYTES;
+    }
+    if ((data.byteLength - offset) % ACCUMULATOR_STRIDE_BYTES !== 0) {
       throw new Error(`Invalid accumulator file length for ${active.chunkKey}`);
     }
-    for (let offset = 0; offset < data.byteLength; offset += ACCUMULATOR_STRIDE_BYTES) {
+    for (; offset < data.byteLength; offset += ACCUMULATOR_STRIDE_BYTES) {
       const acc: VoxelAccumulator = {
         sx: data.readDoubleLE(offset),
         sy: data.readDoubleLE(offset + 8),
@@ -871,15 +970,16 @@ export class ChunkStore {
     return true;
   }
 
-  // Overwrite a chunk's file with its current voxel representatives and upsert its
-  // metadata. The chunk stays resident so fusion continues in place.
+  // Overwrite a chunk's files with its current voxel state (atomic replace of both
+  // the .bin representatives and the .acc sums) and upsert its metadata. The chunk
+  // stays resident so fusion continues in place.
   private persistChunk(active: ActiveChunk): void {
     active.pointsSinceFlush = 0;
     if (active.voxels.size === 0) {
       return;
     }
 
-    const serialized = this.serializeVoxels(active.voxels);
+    const serialized = serializeVoxels(active.voxels, active.appliedSequence);
     fs.mkdirSync(path.dirname(active.filePath), { recursive: true });
     writeFileAtomically(active.accumulatorPath, serialized.accumulatorBuffer);
     writeFileAtomically(active.filePath, serialized.buffer);
@@ -889,14 +989,15 @@ export class ChunkStore {
       .prepare(
         `INSERT INTO chunks (
           session_id, chunk_key, chunk_x, chunk_y, chunk_z, file_path,
-          point_count, batch_count, bytes,
+          point_count, batch_count, bytes, applied_sequence,
           min_x, min_y, min_z, max_x, max_y, max_z, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id, chunk_key) DO UPDATE SET
           file_path = excluded.file_path,
           point_count = excluded.point_count,
           batch_count = chunks.batch_count + 1,
           bytes = excluded.bytes,
+          applied_sequence = excluded.applied_sequence,
           min_x = excluded.min_x,
           min_y = excluded.min_y,
           min_z = excluded.min_z,
@@ -915,6 +1016,7 @@ export class ChunkStore {
         active.voxels.size,
         1,
         serialized.buffer.byteLength,
+        active.appliedSequence,
         serialized.minX,
         serialized.minY,
         serialized.minZ,
@@ -945,54 +1047,6 @@ export class ChunkStore {
     }
     this.activeChunks.delete(dirtyKey);
   }
-
-  // Encode a voxel set to the on-disk / wire 18-byte point format (one representative
-  // per voxel, the component mean) and compute its world-frame bounds in one pass.
-  private serializeVoxels(voxels: Map<string, VoxelAccumulator>): SerializedVoxels {
-    const buffer = Buffer.allocUnsafe(voxels.size * POINT_STRIDE_BYTES);
-    const accumulatorBuffer = Buffer.allocUnsafe(voxels.size * ACCUMULATOR_STRIDE_BYTES);
-    let minX = Number.POSITIVE_INFINITY;
-    let minY = Number.POSITIVE_INFINITY;
-    let minZ = Number.POSITIVE_INFINITY;
-    let maxX = Number.NEGATIVE_INFINITY;
-    let maxY = Number.NEGATIVE_INFINITY;
-    let maxZ = Number.NEGATIVE_INFINITY;
-
-    let offset = 0;
-    for (const acc of voxels.values()) {
-      const x = acc.sx / acc.n;
-      const y = acc.sy / acc.n;
-      const z = acc.sz / acc.n;
-      buffer.writeFloatLE(x, offset);
-      buffer.writeFloatLE(y, offset + 4);
-      buffer.writeFloatLE(z, offset + 8);
-      buffer[offset + 12] = clampU8(Math.round(acc.sr / acc.n));
-      buffer[offset + 13] = clampU8(Math.round(acc.sg / acc.n));
-      buffer[offset + 14] = clampU8(Math.round(acc.sb / acc.n));
-      buffer.writeUInt16LE(clampU16(Math.round(acc.si / acc.n)), offset + 15);
-      buffer[offset + 17] = 0;
-      const accumulatorOffset = (offset / POINT_STRIDE_BYTES) * ACCUMULATOR_STRIDE_BYTES;
-      accumulatorBuffer.writeDoubleLE(acc.sx, accumulatorOffset);
-      accumulatorBuffer.writeDoubleLE(acc.sy, accumulatorOffset + 8);
-      accumulatorBuffer.writeDoubleLE(acc.sz, accumulatorOffset + 16);
-      accumulatorBuffer.writeDoubleLE(acc.sr, accumulatorOffset + 24);
-      accumulatorBuffer.writeDoubleLE(acc.sg, accumulatorOffset + 32);
-      accumulatorBuffer.writeDoubleLE(acc.sb, accumulatorOffset + 40);
-      accumulatorBuffer.writeDoubleLE(acc.si, accumulatorOffset + 48);
-      accumulatorBuffer.writeDoubleLE(acc.n, accumulatorOffset + 56);
-
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (z < minZ) minZ = z;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-      if (z > maxZ) maxZ = z;
-
-      offset += POINT_STRIDE_BYTES;
-    }
-
-    return { buffer, accumulatorBuffer, minX, minY, minZ, maxX, maxY, maxZ };
-  }
 }
 
 function encodeChunkKey(chunkX: number, chunkY: number, chunkZ: number): string {
@@ -1001,6 +1055,81 @@ function encodeChunkKey(chunkX: number, chunkY: number, chunkZ: number): string 
 
 function voxelKey(x: number, y: number, z: number, size: number): string {
   return `${Math.floor(x / size)}_${Math.floor(y / size)}_${Math.floor(z / size)}`;
+}
+
+// Encode a voxel set to the wire 18-byte point format only (one representative per
+// voxel, the component mean). This is the serving path; it skips the sidecar.
+function serializeRepresentatives(voxels: Map<string, VoxelAccumulator>): Buffer {
+  const buffer = Buffer.allocUnsafe(voxels.size * POINT_STRIDE_BYTES);
+  let offset = 0;
+  for (const acc of voxels.values()) {
+    writeRepresentative(buffer, offset, acc);
+    offset += POINT_STRIDE_BYTES;
+  }
+  return buffer;
+}
+
+// Encode a voxel set to both on-disk forms — the 18-byte representatives and the
+// exact accumulator sidecar — and compute its world-frame bounds in one pass.
+function serializeVoxels(voxels: Map<string, VoxelAccumulator>, appliedSequence: number): SerializedVoxels {
+  const buffer = Buffer.allocUnsafe(voxels.size * POINT_STRIDE_BYTES);
+  const accumulatorBuffer = Buffer.allocUnsafe(
+    ACCUMULATOR_HEADER_BYTES + voxels.size * ACCUMULATOR_STRIDE_BYTES,
+  );
+  accumulatorBuffer.writeUInt32LE(ACCUMULATOR_MAGIC, 0);
+  accumulatorBuffer.writeUInt32LE(ACCUMULATOR_VERSION, 4);
+  accumulatorBuffer.writeDoubleLE(appliedSequence, 8);
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+
+  let offset = 0;
+  let accumulatorOffset = ACCUMULATOR_HEADER_BYTES;
+  for (const acc of voxels.values()) {
+    const [x, y, z] = writeRepresentative(buffer, offset, acc);
+    accumulatorBuffer.writeDoubleLE(acc.sx, accumulatorOffset);
+    accumulatorBuffer.writeDoubleLE(acc.sy, accumulatorOffset + 8);
+    accumulatorBuffer.writeDoubleLE(acc.sz, accumulatorOffset + 16);
+    accumulatorBuffer.writeDoubleLE(acc.sr, accumulatorOffset + 24);
+    accumulatorBuffer.writeDoubleLE(acc.sg, accumulatorOffset + 32);
+    accumulatorBuffer.writeDoubleLE(acc.sb, accumulatorOffset + 40);
+    accumulatorBuffer.writeDoubleLE(acc.si, accumulatorOffset + 48);
+    accumulatorBuffer.writeDoubleLE(acc.n, accumulatorOffset + 56);
+
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+
+    offset += POINT_STRIDE_BYTES;
+    accumulatorOffset += ACCUMULATOR_STRIDE_BYTES;
+  }
+
+  return { buffer, accumulatorBuffer, minX, minY, minZ, maxX, maxY, maxZ };
+}
+
+function writeRepresentative(
+  buffer: Buffer,
+  offset: number,
+  acc: VoxelAccumulator,
+): [number, number, number] {
+  const x = acc.sx / acc.n;
+  const y = acc.sy / acc.n;
+  const z = acc.sz / acc.n;
+  buffer.writeFloatLE(x, offset);
+  buffer.writeFloatLE(y, offset + 4);
+  buffer.writeFloatLE(z, offset + 8);
+  buffer[offset + 12] = clampU8(Math.round(acc.sr / acc.n));
+  buffer[offset + 13] = clampU8(Math.round(acc.sg / acc.n));
+  buffer[offset + 14] = clampU8(Math.round(acc.sb / acc.n));
+  buffer.writeUInt16LE(clampU16(Math.round(acc.si / acc.n)), offset + 15);
+  buffer[offset + 17] = 0;
+  return [x, y, z];
 }
 
 // Accumulate 18-byte world-frame points into voxels of the given edge length, one
@@ -1064,17 +1193,6 @@ function writeFileAtomically(filePath: string, data: Buffer): void {
   }
 }
 
-function finalizeStagedFile(stagedPath: string, finalPath: string, chunkKey: string): void {
-  if (fs.existsSync(stagedPath)) {
-    fs.renameSync(stagedPath, finalPath);
-    syncDirectory(path.dirname(finalPath));
-    return;
-  }
-  if (!fs.existsSync(finalPath)) {
-    throw new Error(`Missing staged and final chunk file for ${chunkKey}`);
-  }
-}
-
 function syncDirectory(directoryPath: string): void {
   const descriptor = fs.openSync(directoryPath, 'r');
   try {
@@ -1084,29 +1202,17 @@ function syncDirectory(directoryPath: string): void {
   }
 }
 
-function readDirectories(directoryPath: string): string[] {
+function listLogFiles(directoryPath: string): string[] {
   try {
     return fs
-      .readdirSync(directoryPath, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name);
+      .readdirSync(directoryPath)
+      .filter((name) => name.endsWith('.log'))
+      .map((name) => name.slice(0, -'.log'.length));
   } catch (error) {
     if (isNotFoundError(error)) {
       return [];
     }
     throw error;
-  }
-}
-
-function removeDirectoryIfEmpty(directoryPath: string): void {
-  try {
-    if (fs.readdirSync(directoryPath).length === 0) {
-      fs.rmdirSync(directoryPath);
-    }
-  } catch (error) {
-    if (!isNotFoundError(error)) {
-      throw error;
-    }
   }
 }
 

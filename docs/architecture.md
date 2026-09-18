@@ -77,9 +77,11 @@ options are:
 
 The live store should be the system of record. Potree-compatible output should be a derived product.
 
-For the v1 durability boundary, a point-batch ACK is emitted only after all touched chunk files have
-been atomically replaced and the corresponding session sequence has been persisted. Publishers use
-that ACK for flow control and keep one batch in flight.
+For the v1 durability boundary, a point-batch ACK is emitted only after the raw batch has been
+appended and fsynced to the session's append-only log and fused into the resident chunk cache. Chunk
+files are a derived cache, checkpointed incrementally and rebuilt from the log after a crash
+([`batch-log.md`](./batch-log.md)). Publishers use the ACK for flow control and keep one batch in
+flight.
 
 ### 4. Serving layer
 
@@ -121,5 +123,7 @@ This de-risks the backend before committing to Potree-specific storage decisions
 - What scanner(s) are the first ingestion targets?
 - Should sessions be append-only, or should we support explicit correction/rewrite operations?
 - Is the persistence target room-scale, building-scale, or larger?
-- Do we need raw frame retention, or only fused world-state retention?
+- ~~Do we need raw frame retention, or only fused world-state retention?~~ Resolved: raw batches
+  are retained in the per-session log, since fused state alone cannot support later pose
+  correction. Retention/compaction policy is still open.
 - Should the first live viewer be Potree-augmented, or a simpler Three.js-based prototype?

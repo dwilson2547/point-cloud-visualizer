@@ -205,9 +205,9 @@ code is published as stable.
 
 ### `point_batch_ack`
 
-Sent by the server after a batch has been validated, fused into its touched chunks, atomically
-written to chunk files, and committed to persisted session sequence state. The current server
-therefore treats this as a process-restart-safe acceptance boundary.
+Sent by the server after a batch has been validated, appended and fsynced to the session's batch
+log, and fused into the resident chunk cache. The log is replayed at startup, so the current server
+treats this as a process-restart-safe acceptance boundary without waiting for chunk files.
 
 ```json
 {
@@ -271,7 +271,8 @@ Sent by the server when it rejects a request or detects a protocol violation.
 - After `resume_session`, the publisher sends a fresh `pose_update`; old pose bodies are not retained
   across server restarts
 - `last_client_sequence` may trail the server when an ACK was lost, but it may not be ahead of the
-  persisted server sequence
+  persisted server sequence; publishers should send their last *acked batch* sequence, since a
+  `pose_update` accepted just before a crash may not have been persisted
 
 This gives the server a deterministic resume point and avoids ambiguity during reconnects.
 

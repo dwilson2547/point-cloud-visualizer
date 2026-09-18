@@ -82,6 +82,11 @@ const viewerStates = new Map<WebSocket, ConnectionState>();
 // burst of batches into one re-send per chunk per tick.
 const dirtyChunksBySession = new Map<string, Set<string>>();
 const liveRefreshMs = parseIntegerEnv(process.env.LIVE_REFRESH_MS, 500);
+// Incremental checkpoint: every tick, rewrite at most this many dirty chunk files so
+// the replay-on-restart window stays short without ever stalling ingest for a full
+// cache rewrite (see docs/batch-log.md).
+const checkpointTickMs = parseIntegerEnv(process.env.CHECKPOINT_TICK_MS, 1000);
+const checkpointChunksPerTick = parseIntegerEnv(process.env.CHECKPOINT_CHUNKS_PER_TICK, 8);
 let shuttingDown = false;
 const maxPayloadBytes = Math.max(64 * 1024, maxPointsPerBatch * POINT_STRIDE_BYTES);
 const ingestWss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
@@ -140,6 +145,7 @@ const server = http.createServer((req, res) => {
           pointBatches: session.pointBatches,
           lastSequence: session.lastSequence,
           lastPoseSequence: session.lastPoseSequence,
+          log: chunkStore.getSessionLogSummary(session.sessionId),
         })),
       ),
     );
@@ -770,6 +776,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   console.log(`Received ${signal}, flushing dirty chunks`);
   clearInterval(liveRefreshTimer);
+  clearInterval(checkpointTimer);
   const httpClosed = new Promise<void>((resolve) => server.close(() => resolve()));
   for (const ws of [...ingestWss.clients, ...viewerWss.clients]) {
     ws.close(1001, 'Server shutting down');
@@ -799,6 +806,14 @@ process.on('SIGTERM', () => {
 });
 
 const liveRefreshTimer = setInterval(refreshLiveBases, liveRefreshMs);
+const checkpointTimer = setInterval(() => {
+  try {
+    chunkStore.checkpointTick(checkpointChunksPerTick);
+  } catch (error) {
+    // A failed checkpoint leaves the log as the source of truth; the next tick retries.
+    console.error('Checkpoint tick failed', error);
+  }
+}, checkpointTickMs);
 
 server.listen(port, () => {
   console.log(`point-cloud-visualizer listening on http://localhost:${port}`);

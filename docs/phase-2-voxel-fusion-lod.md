@@ -57,9 +57,11 @@ raw appends.
 - **Flush = full rewrite** of the chunk file with current representatives (not append). Occupied
   voxels per 2 m chunk are bounded (a few thousand for a surface at 4 cm), so rewriting is cheap.
 - **Reload/revisit:** each renderable `.bin` chunk has an `.acc` sidecar containing the float64
-  component sums and sample count for every occupied voxel. Reload restores the exact accumulator
-  weights, so observations after eviction or server restart produce the same mean as an uninterrupted
-  run. The `.bin` format remains the unchanged 18-byte viewer/wire representation.
+  component sums and sample count for every occupied voxel, behind a small header that records the
+  last batch sequence fused into the chunk (used by log replay, see
+  [`batch-log.md`](./batch-log.md)). Reload restores the exact accumulator weights, so observations
+  after eviction or server restart produce the same mean as an uninterrupted run. The `.bin` format
+  remains the unchanged 18-byte viewer/wire representation.
 
 **Live path is untouched.** `chunk_update` deltas still stream the raw incoming batch (local frame +
 pose) to connected viewers for low latency; the viewer ring buffer bounds the *live* cloud. Only the

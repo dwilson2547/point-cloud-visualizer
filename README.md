@@ -41,6 +41,8 @@ Direct sensor-to-server ingestion can remain a stretch goal.
 
 - [`docs/architecture.md`](docs/architecture.md) — initial backend and viewer architecture
 - [`docs/protocol-v1.md`](docs/protocol-v1.md) — draft WebSocket ingest protocol for v1
+- [`docs/batch-log.md`](docs/batch-log.md) — append-only batch log: durability, checkpoint, replay
+- [`docs/phase-2-voxel-fusion-lod.md`](docs/phase-2-voxel-fusion-lod.md) — voxel fusion + LOD design
 - [`docs/vlp16-client.md`](docs/vlp16-client.md) — recommended Velodyne VLP-16 publisher setup
 - [`docs/vlp16-kiss-icp.md`](docs/vlp16-kiss-icp.md) — IMU-free moving VLP-16 trial with KISS-ICP
 - [`docs/vlp16-moving-odometry.md`](docs/vlp16-moving-odometry.md) — ESP32/BMI088 + Point-LIO design
@@ -57,17 +59,21 @@ The repository now includes a first-pass TypeScript server with:
 - `GET /sessions/:sessionId/chunks` for persisted chunk metadata
 - `WS /ws/ingest` for publisher connections
 - `WS /ws/view` for viewer connections
-- SQLite-backed session/chunk metadata under `data/metadata.sqlite`
-- fused world-space `.bin` chunks plus exact accumulator `.acc` sidecars under `data/chunks/`
-- session recovery from SQLite so persisted recordings remain viewable and resumable after restart
-- atomic chunk-file replacement before `point_batch_ack`
+- an append-only per-session batch log under `data/log/` — the durability anchor; one write and
+  one fsync per accepted batch (see [`docs/batch-log.md`](docs/batch-log.md))
+- SQLite-backed session/chunk metadata under `data/metadata.sqlite` (WAL mode)
+- fused world-space `.bin` chunks plus exact accumulator `.acc` sidecars under `data/chunks/`, a
+  cache derived from the log and checkpointed incrementally
+- session recovery from SQLite plus log replay, so persisted recordings remain viewable and
+  resumable after a restart or crash
 - bounded dirty chunk buffers with flush-on-threshold, cache pressure, and session close
 - bounded in-memory pose tracking
 - live viewer fan-out of accepted point batches
 
-This is still a scaffold, but storage is now disk-backed. The live write path partitions accepted
-points into fixed world chunks, fuses them into bounded voxel representatives, and atomically
-replaces touched chunk files while tracking metadata in SQLite.
+This is still a scaffold, but storage is now disk-backed. The live write path appends each raw
+batch to the session log, then partitions its points into fixed world chunks and fuses them into
+bounded voxel representatives in memory. Chunk files are rewritten in the background by an
+incremental checkpoint, and anything not yet checkpointed is replayed from the log at startup.
 
 ## Quickstart
 
@@ -95,11 +101,17 @@ The chunk store is configurable by environment variables:
 - `MAX_VIEWER_BUFFERED_BYTES` — disconnect viewers that stop consuming before their outbound queue
   exceeds this limit (default: `33554432`)
 - `LIVE_REFRESH_MS` — coalescing interval for refreshing changed LOD chunks (default: `500`)
+- `CHECKPOINT_TICK_MS` — how often the incremental checkpoint runs (default: `1000`)
+- `CHECKPOINT_CHUNKS_PER_TICK` — chunk files one checkpoint tick may rewrite (default: `8`)
 
-`point_batch_ack` is sent only after every touched chunk has been atomically replaced and the
-session sequence/counters have been persisted. Publishers should keep at most one point batch in
-flight and wait for its ACK before sending the next. After a server restart, a resumed publisher
-must send a fresh `pose_update` before its next point batch.
+`point_batch_ack` is sent only after the batch has been appended and fsynced to the session's
+batch log and fused into the resident chunk cache. Publishers should keep at most one point batch
+in flight and wait for its ACK before sending the next. After a server restart, a resumed publisher
+must send a fresh `pose_update` before its next point batch, and should resume from its last
+*acked batch* sequence.
+
+`npm run bench:ingest` measures the durable write path with VLP-16-sized batches; the numbers
+behind the current design are in [`docs/batch-log.md`](docs/batch-log.md).
 
 Node 22 currently exposes `node:sqlite` as an experimental API, so test runs and server startup may
 print an experimental warning while using the built-in SQLite-backed metadata store.
