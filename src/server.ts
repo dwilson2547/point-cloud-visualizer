@@ -24,7 +24,8 @@ import {
   type ViewerJoinMessage,
   type ViewerViewMessage,
 } from './protocol.js';
-import { ChunkStore, DurableBatchError } from './chunk-store.js';
+import { ChunkStore, DurableBatchError, type RebuildResult } from './chunk-store.js';
+import { validatePoseCorrections } from './pose-corrections.js';
 import { SessionStore } from './session-store.js';
 import {
   buildFrustum,
@@ -159,12 +160,123 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  const sessionResourceMatch = url.pathname.match(/^\/sessions\/([^/]+)\/(log|pose-corrections|rebuild)$/);
+  if (sessionResourceMatch) {
+    void handleSessionResource(
+      req,
+      res,
+      decodeURIComponent(sessionResourceMatch[1]),
+      sessionResourceMatch[2] as 'log' | 'pose-corrections' | 'rebuild',
+    );
+    return;
+  }
+
   if (serveStatic(req, res, url.pathname)) {
     return;
   }
 
   res.writeHead(404).end('Not found');
 });
+
+// Alignment-facing HTTP surface (see docs/alignment.md):
+//   GET    /sessions/:id/log               the raw batch log, for the sidecar
+//   GET    /sessions/:id/pose-corrections  the installed corrections, if any
+//   PUT    /sessions/:id/pose-corrections  install corrections and rebuild the session
+//   DELETE /sessions/:id/pose-corrections  remove corrections and rebuild from raw poses
+//   POST   /sessions/:id/rebuild           re-fuse from the log under current poses
+async function handleSessionResource(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  sessionId: string,
+  resource: 'log' | 'pose-corrections' | 'rebuild',
+): Promise<void> {
+  if (!sessionStore.hasSession(sessionId)) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: `Unknown session ${sessionId}` }));
+    return;
+  }
+  try {
+    if (resource === 'log' && req.method === 'GET') {
+      const logPath = chunkStore.sessionLogPath(sessionId);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(logPath);
+      } catch {
+        res.writeHead(404).end('No batch log for this session');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': stat.size });
+      fs.createReadStream(logPath).pipe(res);
+      return;
+    }
+    if (resource === 'pose-corrections' && req.method === 'GET') {
+      const corrections = chunkStore.getPoseCorrections(sessionId);
+      res.writeHead(corrections ? 200 : 404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(corrections ?? { error: 'No pose corrections installed' }));
+      return;
+    }
+    let rebuilt: RebuildResult;
+    if (resource === 'pose-corrections' && req.method === 'PUT') {
+      const body = await readJsonBody(req, 64 * 1024 * 1024);
+      const corrections = validatePoseCorrections(body, sessionId);
+      rebuilt = chunkStore.setPoseCorrections(sessionId, corrections);
+    } else if (resource === 'pose-corrections' && req.method === 'DELETE') {
+      rebuilt = chunkStore.setPoseCorrections(sessionId, null);
+    } else if (resource === 'rebuild' && req.method === 'POST') {
+      rebuilt = chunkStore.rebuildSession(sessionId);
+    } else {
+      res.writeHead(405).end('Method not allowed');
+      return;
+    }
+    notifySessionRebuilt(sessionId, rebuilt);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ session_id: sessionId, ...rebuilt }));
+  } catch (error) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: getErrorMessage(error) }));
+  }
+}
+
+function readJsonBody(req: http.IncomingMessage, limitBytes: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    req.on('data', (chunk: Buffer) => {
+      received += chunk.byteLength;
+      if (received > limitBytes) {
+        reject(new Error(`Request body exceeds ${limitBytes} bytes`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+// After a rebuild every viewer of the session holds stale data: tell them to clear,
+// forget what was sent to LOD viewers, and mark every chunk dirty so the refresh tick
+// re-sends the visible base layer against each viewer's current camera.
+function notifySessionRebuilt(sessionId: string, rebuilt: RebuildResult): void {
+  const viewers = viewerSockets.get(sessionId);
+  if (viewers) {
+    for (const ws of viewers) {
+      viewerStates.get(ws)?.sentLevels?.clear();
+      send(ws, { type: 'session_rebuilt', session_id: sessionId, ...rebuilt });
+    }
+  }
+  markChunksDirty(
+    sessionId,
+    chunkStore.listSessionChunkKeys(sessionId).map((cell) => cell.chunkKey),
+  );
+}
 
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string): boolean {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -347,7 +459,7 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
     lastSequence: accepted.header.sequence,
     lastSeenAt: accepted.header.timestamp,
   };
-  const touchedKeys = chunkStore.storeAcceptedBatchDurably(accepted, nextSession);
+  const { touchedKeys, pose } = chunkStore.storeAcceptedBatchDurably(accepted, nextSession);
   sessionStore.commitPointBatch(accepted);
   markChunksDirty(accepted.session.sessionId, touchedKeys);
 
@@ -359,7 +471,9 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
     rejected_points: 0,
   });
 
-  broadcastChunkUpdate(accepted.header, accepted.payload, accepted.pose.pose);
+  // Viewers place the live overlay with the pose the batch was actually fused with,
+  // which differs from the publisher's when pose corrections are installed.
+  broadcastChunkUpdate(accepted.header, accepted.payload, pose);
 }
 
 function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMode = false): void {

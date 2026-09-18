@@ -1,0 +1,114 @@
+"""pcv-align-demo: publish the synthetic drifted loop into a live server session, so the
+whole path can be seen in the viewer: drifted walls doubling up, then `pcv-align`
+snapping them back."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import sys
+import time
+
+import numpy as np
+from websockets.sync.client import connect
+
+from .log import POINT_DTYPE, matrix_to_pose
+from .synthetic import Scenario, make_batches
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Publish a synthetic drifted loop to a server")
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--server-url", default="ws://localhost:8080/ws/ingest")
+    parser.add_argument("--rate", type=float, default=10.0, help="batches per second")
+    parser.add_argument("--yaw-bias", type=float, default=Scenario.yaw_bias_deg_per_step)
+    parser.add_argument("--scale-error", type=float, default=Scenario.scale_error)
+    args = parser.parse_args(argv)
+
+    scenario = Scenario(yaw_bias_deg_per_step=args.yaw_bias, scale_error=args.scale_error)
+    batches, _ = make_batches(scenario)
+    with connect(args.server_url, max_size=None) as ws:
+        ws.send(
+            json.dumps(
+                {
+                    "type": "create_session",
+                    "protocol_version": 1,
+                    "session_id": args.session_id,
+                    "publisher_id": "pcv-align-demo",
+                    "started_at": _now(),
+                    "frame_id": "drifted_odom",
+                    "units": "meters",
+                    "metadata": {"odometry": "synthetic-drift"},
+                }
+            )
+        )
+        ack = json.loads(ws.recv())
+        if ack.get("type") != "session_ack":
+            print(f"session rejected: {ack}", file=sys.stderr)
+            return 1
+        print(f"publishing {len(batches)} batches; viewer: http://localhost:8080/?session_id={args.session_id}")
+        for batch in batches:
+            timestamp = _now()
+            pose = matrix_to_pose(batch.pose)
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "pose_update",
+                        "session_id": args.session_id,
+                        "publisher_id": "pcv-align-demo",
+                        "sequence": batch.pose_sequence,
+                        "timestamp": timestamp,
+                        "pose": pose,
+                    }
+                )
+            )
+            wire = np.zeros(batch.points.shape[0], dtype=POINT_DTYPE)
+            wire["x"], wire["y"], wire["z"] = batch.points[:, 0], batch.points[:, 1], batch.points[:, 2]
+            height = np.clip((batch.points[:, 2] + 1.5) / 3.0, 0.0, 1.0)
+            wire["r"] = (60 + 160 * height).astype(np.uint8)
+            wire["g"] = (120 + 80 * (1 - height)).astype(np.uint8)
+            wire["b"] = (200 - 120 * height).astype(np.uint8)
+            wire["intensity"] = 1000
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "point_batch_header",
+                        "session_id": args.session_id,
+                        "publisher_id": "pcv-align-demo",
+                        "sequence": batch.sequence,
+                        "timestamp": timestamp,
+                        "pose_sequence": batch.pose_sequence,
+                        "point_count": int(batch.points.shape[0]),
+                        "point_format": "xyz_rgb_i_v1",
+                        "encoding": "binary_le",
+                        "compression": "none",
+                        "stride_bytes": 18,
+                    }
+                )
+            )
+            ws.send(wire.tobytes())
+            response = json.loads(ws.recv())
+            if response.get("type") != "point_batch_ack":
+                print(f"batch rejected: {response}", file=sys.stderr)
+                return 1
+            time.sleep(1.0 / args.rate)
+        ws.send(
+            json.dumps(
+                {
+                    "type": "close_session",
+                    "session_id": args.session_id,
+                    "publisher_id": "pcv-align-demo",
+                    "sequence": batches[-1].sequence + 1,
+                }
+            )
+        )
+    print("done; now run: alignment/run.sh --session-id", args.session_id)
+    return 0
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

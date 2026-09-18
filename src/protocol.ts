@@ -180,6 +180,16 @@ export interface ChunkDropMessage {
   chunk_key: string;
 }
 
+// The session's fused cloud was rebuilt from its log (pose corrections applied or
+// removed). Every chunk the viewer holds is stale, including its live overlay; it
+// clears everything and the server re-sends the base layer for the current view.
+export interface SessionRebuiltMessage {
+  type: 'session_rebuilt';
+  session_id: string;
+  batches: number;
+  chunks: number;
+}
+
 export type ServerMessage =
   | SessionAckMessage
   | PointBatchAckMessage
@@ -188,7 +198,8 @@ export type ServerMessage =
   | ChunkUpdateMessage
   | ChunkBootstrapMessage
   | ChunkLodMessage
-  | ChunkDropMessage;
+  | ChunkDropMessage
+  | SessionRebuiltMessage;
 
 export function parseClientMessage(input: string): ClientControlMessage {
   const parsed = JSON.parse(input) as { type?: string };

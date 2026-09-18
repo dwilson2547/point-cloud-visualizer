@@ -61,7 +61,7 @@ for (let b = 0; b < BATCHES; b++) {
   const next = { ...session, lastSequence: seq, pointBatches: b + 1, totalPoints: (b + 1) * N };
   const f0 = fsyncs;
   const t0 = performance.now();
-  const keys = store.storeAcceptedBatchDurably(accepted, next);
+  const { touchedKeys: keys } = store.storeAcceptedBatchDurably(accepted, next);
   lat.push(performance.now() - t0);
   chunksTouched = keys.length;
   if (b === 0) console.log(`first batch: ${keys.length} chunks, ${fsyncs - f0} fsyncs, ${lat[0].toFixed(1)} ms`);

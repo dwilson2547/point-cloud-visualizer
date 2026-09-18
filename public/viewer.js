@@ -216,6 +216,13 @@ function connect(sessionId) {
         pendingHeader = msg; // binary payload follows next
       } else if (msg.type === 'chunk_drop') {
         disposeBaseChunk(msg.chunk_key);
+      } else if (msg.type === 'session_rebuilt') {
+        // Pose corrections changed: everything held is in the old frame. Clear both
+        // layers and ask for the base layer again from the current camera.
+        resetCloud();
+        firstData = true;
+        viewDirty = true;
+        setStatus(`rebuilt (${msg.batches} batches)`, true);
       } else if (msg.type === 'viewer_session_state') {
         stats.lastSeq = msg.last_sequence ?? '—';
       } else if (msg.type === 'error') {

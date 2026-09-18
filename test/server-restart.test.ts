@@ -1,50 +1,14 @@
 import assert from 'node:assert/strict';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
-import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { WebSocket, type RawData } from 'ws';
+import { WebSocket } from 'ws';
 
 import { POINT_FORMAT, POINT_STRIDE_BYTES } from '../src/protocol.js';
-
-interface QueuedMessage {
-  data: RawData;
-  isBinary: boolean;
-}
-
-class SocketMessages {
-  private readonly queued: QueuedMessage[] = [];
-  private readonly waiting: Array<(message: QueuedMessage) => void> = [];
-
-  constructor(ws: WebSocket) {
-    ws.on('message', (data, isBinary) => {
-      const resolve = this.waiting.shift();
-      if (resolve) {
-        resolve({ data, isBinary });
-      } else {
-        this.queued.push({ data, isBinary });
-      }
-    });
-  }
-
-  next(): Promise<QueuedMessage> {
-    const message = this.queued.shift();
-    if (message) {
-      return Promise.resolve(message);
-    }
-    return new Promise((resolve) => this.waiting.push(resolve));
-  }
-
-  async nextJson(): Promise<Record<string, unknown>> {
-    const message = await this.next();
-    assert.equal(message.isBinary, false);
-    return JSON.parse(message.data.toString()) as Record<string, unknown>;
-  }
-}
+import { SocketMessages, connect, reservePort, startServer, stopServer } from './helpers.js';
 
 test('restores sessions and chunks across restart, then resumes at the persisted sequence', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-restart-'));
@@ -162,69 +126,4 @@ function sendPoseAndBatch(ws: WebSocket, poseSequence: number, batchSequence: nu
     }),
   );
   ws.send(payload, { binary: true });
-}
-
-async function reservePort(): Promise<number> {
-  const server = net.createServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const address = server.address();
-  assert.notEqual(address, null);
-  assert.equal(typeof address, 'object');
-  const port = (address as net.AddressInfo).port;
-  server.close();
-  await once(server, 'close');
-  return port;
-}
-
-async function startServer(port: number, dataDir: string): Promise<ChildProcessWithoutNullStreams> {
-  const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
-    cwd: path.resolve(import.meta.dirname, '..'),
-    env: {
-      ...process.env,
-      DATA_DIR: dataDir,
-      PORT: String(port),
-      NODE_NO_WARNINGS: '1',
-    },
-    stdio: 'pipe',
-  });
-  let output = '';
-  child.stdout.on('data', (data) => {
-    output += data.toString();
-  });
-  child.stderr.on('data', (data) => {
-    output += data.toString();
-  });
-
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
-      throw new Error(`Server exited during startup:\n${output}`);
-    }
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
-      if (response.ok) {
-        return child;
-      }
-    } catch {
-      // Server is still starting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  child.kill('SIGTERM');
-  throw new Error(`Server did not start:\n${output}`);
-}
-
-async function stopServer(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-  child.kill('SIGTERM');
-  await once(child, 'exit');
-}
-
-async function connect(url: string): Promise<WebSocket> {
-  const ws = new WebSocket(url);
-  await once(ws, 'open');
-  return ws;
 }

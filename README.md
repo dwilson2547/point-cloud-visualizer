@@ -42,6 +42,7 @@ Direct sensor-to-server ingestion can remain a stretch goal.
 - [`docs/architecture.md`](docs/architecture.md) — initial backend and viewer architecture
 - [`docs/protocol-v1.md`](docs/protocol-v1.md) — draft WebSocket ingest protocol for v1
 - [`docs/batch-log.md`](docs/batch-log.md) — append-only batch log: durability, checkpoint, replay
+- [`docs/alignment.md`](docs/alignment.md) — pose graph + loop closure sidecar and the corrections layer
 - [`docs/phase-2-voxel-fusion-lod.md`](docs/phase-2-voxel-fusion-lod.md) — voxel fusion + LOD design
 - [`docs/vlp16-client.md`](docs/vlp16-client.md) — recommended Velodyne VLP-16 publisher setup
 - [`docs/vlp16-kiss-icp.md`](docs/vlp16-kiss-icp.md) — IMU-free moving VLP-16 trial with KISS-ICP
@@ -57,6 +58,9 @@ The repository now includes a first-pass TypeScript server with:
 - `GET /storage` for chunk-store summary
 - `GET /sessions` for restored and active session summaries
 - `GET /sessions/:sessionId/chunks` for persisted chunk metadata
+- `GET /sessions/:sessionId/log` for the raw batch log
+- `GET|PUT|DELETE /sessions/:sessionId/pose-corrections` and `POST /sessions/:sessionId/rebuild`
+  for the alignment layer
 - `WS /ws/ingest` for publisher connections
 - `WS /ws/view` for viewer connections
 - an append-only per-session batch log under `data/log/` — the durability anchor; one write and
@@ -134,6 +138,20 @@ calibration JSON shape.
 
 For moving tests before the external IMU is ready, use the standalone
 [KISS-ICP publisher](docs/vlp16-kiss-icp.md).
+
+## Alignment
+
+Odometry drift can be corrected after the fact. The `alignment/` sidecar builds a keyframe pose
+graph over a session's batch log, verifies loop closures with ICP, and installs corrected poses;
+the server re-fuses the session from its log and viewers snap to the corrected cloud.
+
+```bash
+alignment/setup.sh
+alignment/.venv/bin/pcv-align-demo --session-id demo-loop    # synthetic drifted loop
+alignment/run.sh --session-id demo-loop --loop-min-gap 15      # align + install
+```
+
+See [`docs/alignment.md`](docs/alignment.md) for the pipeline, tuning knobs and measured results.
 
 ## Runtime scripts
 

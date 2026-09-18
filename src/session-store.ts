@@ -235,6 +235,10 @@ export class SessionStore {
     return this.sessions.size;
   }
 
+  hasSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
+
   listSessions(): SessionRecord[] {
     return [...this.sessions.values()];
   }

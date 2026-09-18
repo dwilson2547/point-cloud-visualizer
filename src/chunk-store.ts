@@ -8,6 +8,13 @@ import {
 } from './session-store.js';
 import { POINT_STRIDE_BYTES, type Pose } from './protocol.js';
 import { BatchLogWriter, replayLog, type LogRecordHeader } from './batch-log.js';
+import {
+  PoseCorrectionMap,
+  deletePoseCorrections,
+  loadPoseCorrections,
+  savePoseCorrections,
+  type PoseCorrections,
+} from './pose-corrections.js';
 
 // Accumulator sidecar (.acc): a 16-byte header then one 64-byte record per voxel.
 //   u32 magic 'PCVA', u32 version, f64 applied_sequence (last batch fused into it)
@@ -63,6 +70,18 @@ export interface StorageSummary {
   persistedChunks: number;
   persistedBytes: number;
   logBytes: number;
+}
+
+// What fusing a batch produced: the chunks it touched (for viewer refresh) and the
+// pose it was actually fused with (the logged pose, or its correction).
+export interface FusedBatch {
+  touchedKeys: string[];
+  pose: Pose;
+}
+
+export interface RebuildResult {
+  batches: number;
+  chunks: number;
 }
 
 export class DurableBatchError extends Error {
@@ -150,6 +169,8 @@ export class ChunkStore {
   // order is the LRU order used for eviction.
   private readonly activeChunks = new Map<string, ActiveChunk>();
   private readonly sessionLogs = new Map<string, SessionLogState>();
+  // Per-session pose corrections, loaded lazily from data/poses; null = none on disk.
+  private readonly corrections = new Map<string, PoseCorrectionMap | null>();
 
   constructor(options: ChunkStoreOptions) {
     this.rootDir = options.rootDir;
@@ -240,15 +261,12 @@ export class ChunkStore {
 
   // Fuse a batch into the resident chunk cache without logging it. For tests and
   // tooling; the server always goes through storeAcceptedBatchDurably.
-  storeAcceptedBatch(accepted: AcceptedBatch): string[] {
+  storeAcceptedBatch(accepted: AcceptedBatch): FusedBatch {
     this.collectBatchChunkKeys(accepted);
-    return this.fuseBatch(
-      accepted.session.sessionId,
-      accepted.header.sequence,
-      accepted.pose.pose,
-      accepted.payload,
-      true,
-    );
+    const sessionId = accepted.session.sessionId;
+    const pose = this.effectivePose(sessionId, accepted.header.pose_sequence, accepted.pose.pose);
+    const touchedKeys = this.fuseBatch(sessionId, accepted.header.sequence, pose, accepted.payload, true);
+    return { touchedKeys, pose };
   }
 
   // The durable ingest path: append the raw batch to the session log (one write,
@@ -256,7 +274,7 @@ export class ChunkStore {
   // Once this returns the batch survives a crash — anything not yet reflected in
   // persisted chunk files is replayed from the log at the next startup. Returns the
   // chunk keys the batch touched so callers can refresh them for viewers.
-  storeAcceptedBatchDurably(accepted: AcceptedBatch, nextSession: SessionSnapshot): string[] {
+  storeAcceptedBatchDurably(accepted: AcceptedBatch, nextSession: SessionSnapshot): FusedBatch {
     const sessionId = accepted.session.sessionId;
     const batchChunkKeys = this.collectBatchChunkKeys(accepted);
     if (batchChunkKeys.size > this.maxDirtyChunks) {
@@ -266,7 +284,7 @@ export class ChunkStore {
     }
     try {
       const state = this.sessionLog(sessionId);
-      const writer = state.writer ?? (state.writer = new BatchLogWriter(this.logPath(sessionId)));
+      const writer = state.writer ?? (state.writer = new BatchLogWriter(this.sessionLogPath(sessionId)));
       const record: LogRecordHeader = {
         sequence: accepted.header.sequence,
         pose_sequence: accepted.header.pose_sequence,
@@ -278,16 +296,11 @@ export class ChunkStore {
       this.durableBatchHook?.('logged');
 
       this.prepareActiveCapacity(sessionId, batchChunkKeys);
-      const touchedKeys = this.fuseBatch(
-        sessionId,
-        accepted.header.sequence,
-        accepted.pose.pose,
-        accepted.payload,
-        true,
-      );
+      const pose = this.effectivePose(sessionId, accepted.header.pose_sequence, accepted.pose.pose);
+      const touchedKeys = this.fuseBatch(sessionId, accepted.header.sequence, pose, accepted.payload, true);
       this.syncSession(nextSession);
       this.durableBatchHook?.('fused');
-      return touchedKeys;
+      return { touchedKeys, pose };
     } catch (error) {
       throw new DurableBatchError(
         `Failed to durably commit batch ${accepted.header.sequence} for ${sessionId}`,
@@ -380,6 +393,75 @@ export class ChunkStore {
       touchedKeys.push(active.chunkKey);
     }
     return touchedKeys;
+  }
+
+  // The pose a batch is fused with: its logged pose unless the session has corrections.
+  effectivePose(sessionId: string, poseSequence: number, logged: Pose): Pose {
+    const map = this.correctionMap(sessionId);
+    return map ? map.apply(poseSequence, logged) : logged;
+  }
+
+  getPoseCorrections(sessionId: string): PoseCorrections | null {
+    return this.correctionMap(sessionId)?.corrections ?? null;
+  }
+
+  // Install (or with null, remove) a session's pose corrections and rebuild its fused
+  // chunks from the log under the new poses. The log itself is never modified.
+  setPoseCorrections(sessionId: string, corrections: PoseCorrections | null): RebuildResult {
+    if (corrections) {
+      savePoseCorrections(this.rootDir, corrections);
+      this.corrections.set(sessionId, new PoseCorrectionMap(corrections));
+    } else {
+      deletePoseCorrections(this.rootDir, sessionId);
+      this.corrections.set(sessionId, null);
+    }
+    return this.rebuildSession(sessionId);
+  }
+
+  // Throw away a session's fused chunks (resident and on disk) and re-fuse every
+  // logged batch under the current effective poses. Synchronous: ingest for the
+  // session waits, which is the point — nothing interleaves with the rebuild.
+  rebuildSession(sessionId: string): RebuildResult {
+    const prefix = `${sessionId}:`;
+    for (const key of [...this.activeChunks.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.activeChunks.delete(key); // dropped, not persisted
+      }
+    }
+    for (const chunk of this.listSessionChunks(sessionId)) {
+      removeIfPresent(path.join(this.rootDir, chunk.filePath));
+      removeIfPresent(path.join(this.chunksDir, sessionId, `${chunk.chunkKey}.acc`));
+    }
+    this.database.prepare('DELETE FROM chunks WHERE session_id = ?').run(sessionId);
+
+    const state = this.sessionLog(sessionId);
+    state.sweep = undefined;
+    state.checkpointOffset = 0;
+    this.database.prepare('UPDATE sessions SET checkpoint_offset = 0 WHERE session_id = ?').run(sessionId);
+
+    const result = replayLog(this.sessionLogPath(sessionId), 0, (record) => {
+      const { header, payload } = record;
+      const pose = this.effectivePose(sessionId, header.pose_sequence, header.pose);
+      this.fuseBatch(sessionId, header.sequence, pose, payload, true);
+    });
+    state.endOffset = result.endOffset;
+    this.checkpointSession(sessionId);
+    this.log(`Rebuilt ${sessionId}: ${result.records} batches re-fused`);
+    return { batches: result.records, chunks: this.listSessionChunkKeys(sessionId).length };
+  }
+
+  sessionLogPath(sessionId: string): string {
+    return path.join(this.logsDir, `${sessionId}.log`);
+  }
+
+  private correctionMap(sessionId: string): PoseCorrectionMap | null {
+    let map = this.corrections.get(sessionId);
+    if (map === undefined) {
+      const loaded = loadPoseCorrections(this.rootDir, sessionId);
+      map = loaded ? new PoseCorrectionMap(loaded) : null;
+      this.corrections.set(sessionId, map);
+    }
+    return map;
   }
 
   // Advance a session's replay start. A sweep snapshots the log end and the set of
@@ -749,7 +831,7 @@ export class ChunkStore {
     for (const row of rows) {
       const sessionId = String(row.session_id);
       known.add(sessionId);
-      const logPath = this.logPath(sessionId);
+      const logPath = this.sessionLogPath(sessionId);
       const state = this.sessionLog(sessionId);
       state.checkpointOffset = Number(row.checkpoint_offset);
       let lastSequence = Number(row.last_sequence);
@@ -759,7 +841,8 @@ export class ChunkStore {
 
       const result = replayLog(logPath, state.checkpointOffset, (record) => {
         const { header, payload } = record;
-        this.fuseBatch(sessionId, header.sequence, header.pose, payload, true);
+        const pose = this.effectivePose(sessionId, header.pose_sequence, header.pose);
+        this.fuseBatch(sessionId, header.sequence, pose, payload, true);
         if (header.sequence > lastSequence) {
           // Counters in SQLite lag the log (they are only written after the fuse), so
           // records past the persisted sequence were never counted.
@@ -860,10 +943,6 @@ export class ChunkStore {
       this.sessionLogs.set(sessionId, state);
     }
     return state;
-  }
-
-  private logPath(sessionId: string): string {
-    return path.join(this.logsDir, `${sessionId}.log`);
   }
 
   // Return the resident chunk for a cell, creating it (and seeding it from any
@@ -1199,6 +1278,16 @@ function syncDirectory(directoryPath: string): void {
     fs.fsyncSync(descriptor);
   } finally {
     fs.closeSync(descriptor);
+  }
+}
+
+function removeIfPresent(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
   }
 }
 

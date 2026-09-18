@@ -706,3 +706,89 @@ test('rejects excessive chunk fan-out before mutating the store', () => {
   assert.equal(chunkStore.readSessionWorldChunks(session.sessionId).length, 0);
   chunkStore.close();
 });
+
+test('pose corrections are applied on rebuild, on live fusion, and after a restart', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-corr-store-'));
+  const sessionStore = new SessionStore();
+  let chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'corr',
+    publisher_id: 'corr-pub',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+  const storeBatch = (poseSequence: number, batchSequence: number): void => {
+    sessionStore.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: 'corr',
+      publisher_id: 'corr-pub',
+      sequence: poseSequence,
+      timestamp: `2026-07-10T00:00:0${poseSequence}Z`,
+      pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    const payload = Buffer.alloc(POINT_STRIDE_BYTES);
+    payload.writeFloatLE(0.5, 0);
+    payload.writeFloatLE(0.5, 4);
+    payload.writeFloatLE(0.5, 8);
+    const accepted = sessionStore.preparePointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: 'corr',
+        publisher_id: 'corr-pub',
+        sequence: batchSequence,
+        timestamp: `2026-07-10T00:00:0${batchSequence}Z`,
+        pose_sequence: poseSequence,
+        point_count: 1,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    chunkStore.storeAcceptedBatchDurably(accepted, { ...sessionStore.listSessions()[0], lastSequence: batchSequence });
+    sessionStore.commitPointBatch(accepted);
+  };
+  const cellsOf = (): string => chunkStore.listSessionChunkKeys('corr').map((c) => c.chunkKey).sort().join(' ');
+
+  storeBatch(1, 2);
+  storeBatch(3, 4);
+  assert.equal(cellsOf(), '0_0_0');
+
+  // Rotate pose 3 by 90° about z and shift +2 m in x: (0.5,0.5,0.5) -> (1.5,0.5,0.5).
+  const result = chunkStore.setPoseCorrections('corr', {
+    session_id: 'corr',
+    generated_at: '2026-07-10T00:00:10Z',
+    poses: [{ pose_sequence: 3, pose: { translation_m: [2, 0, 0], rotation_xyzw: [0, 0, Math.SQRT1_2, Math.SQRT1_2] } }],
+    tail: { translation_m: [0, 2, 0], rotation_xyzw: [0, 0, 0, 1] },
+  });
+  assert.equal(result.batches, 2);
+  assert.equal(result.chunks, 2);
+  assert.equal(cellsOf(), '0_0_0 1_0_0');
+  const [corrected] = chunkStore.readSessionWorldChunks('corr').filter((b) => b.readFloatLE(0) > 1);
+  assert.ok(Math.abs(corrected.readFloatLE(0) - 1.5) < 1e-6);
+  assert.ok(Math.abs(corrected.readFloatLE(4) - 0.5) < 1e-6);
+
+  // A live batch past the last corrected sequence gets the tail: (0.5,2.5,0.5).
+  storeBatch(5, 6);
+  assert.equal(cellsOf(), '0_0_0 0_2_0 1_0_0');
+
+  // Restart: corrections come back from disk and still shape both replay and new batches.
+  chunkStore.close();
+  chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  assert.equal(cellsOf(), '0_0_0 0_2_0 1_0_0');
+  assert.equal(chunkStore.getPoseCorrections('corr')?.poses.length, 1);
+  storeBatch(7, 8);
+  assert.equal(cellsOf(), '0_0_0 0_2_0 1_0_0');
+
+  // Removing them rebuilds from the raw logged poses: every point back in one cell.
+  const raw = chunkStore.setPoseCorrections('corr', null);
+  assert.equal(raw.batches, 4);
+  assert.equal(cellsOf(), '0_0_0');
+  assert.equal(chunkStore.getPoseCorrections('corr'), null);
+  chunkStore.close();
+});
