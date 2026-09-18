@@ -995,3 +995,100 @@ test('observation filter drops voxels the sensor kept looking at but rarely hit'
   assert.equal(new Map(chunkStore.listSessionChunks('obs').map((c) => [c.chunkKey, c])).get('5_0_0')?.opportunities, 10);
   chunkStore.close();
 });
+
+test('deriveChunk reports new voxels since a version and a total a viewer can reconcile', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-delta-'));
+  const sessionStore = new SessionStore();
+  const chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, numLevels: 3, log: () => {} });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'delta',
+    publisher_id: 'delta-pub',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+  let sequence = 0;
+  const storeBatch = (points: Array<[number, number, number]>): void => {
+    const poseSequence = ++sequence;
+    const batchSequence = ++sequence;
+    sessionStore.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: 'delta',
+      publisher_id: 'delta-pub',
+      sequence: poseSequence,
+      timestamp: '2026-07-10T00:00:01Z',
+      pose: { translation_m: [0, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    const payload = Buffer.alloc(points.length * POINT_STRIDE_BYTES);
+    points.forEach(([x, y, z], i) => {
+      payload.writeFloatLE(x, i * POINT_STRIDE_BYTES);
+      payload.writeFloatLE(y, i * POINT_STRIDE_BYTES + 4);
+      payload.writeFloatLE(z, i * POINT_STRIDE_BYTES + 8);
+    });
+    const accepted = sessionStore.preparePointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: 'delta',
+        publisher_id: 'delta-pub',
+        sequence: batchSequence,
+        timestamp: '2026-07-10T00:00:01Z',
+        pose_sequence: poseSequence,
+        point_count: points.length,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    chunkStore.storeAcceptedBatchDurably(accepted, { ...sessionStore.listSessions()[0], lastSequence: batchSequence });
+    sessionStore.commitPointBatch(accepted);
+  };
+  const finest = 2; // 4 cm; level 1 = 8 cm; level 0 = 16 cm
+  const n = (b: Buffer): number => b.byteLength / POINT_STRIDE_BYTES;
+
+  // Three fine voxels, two of them inside the same 8 cm cell.
+  storeBatch([[0.01, 0.01, 0.01], [0.05, 0.01, 0.01], [0.41, 0.41, 0.41]]);
+  let key = chunkStore.deriveChunk('delta', '0_0_0', finest);
+  assert.deepEqual([n(key.points), key.version, key.total], [3, 3, 3]);
+  let coarse = chunkStore.deriveChunk('delta', '0_0_0', 1);
+  assert.deepEqual([n(coarse.points), coarse.version, coarse.total], [2, 3, 2]);
+
+  // A hit into an existing voxel: nothing new at any level, version unchanged.
+  storeBatch([[0.012, 0.012, 0.012]]);
+  let delta = chunkStore.deriveChunk('delta', '0_0_0', finest, undefined, key.version);
+  assert.deepEqual([n(delta.points), delta.version, delta.total], [0, 3, 3]);
+
+  // Two new fine voxels: one joins the existing 8 cm cell, one opens a new cell.
+  storeBatch([[0.01, 0.05, 0.01], [0.81, 0.81, 0.81]]);
+  delta = chunkStore.deriveChunk('delta', '0_0_0', finest, undefined, key.version);
+  assert.deepEqual([n(delta.points), delta.version, delta.total], [2, 5, 5]);
+  assert.ok(Math.abs(delta.points.readFloatLE(0) - 0.01) < 1e-6, 'delta is the tail in insertion order');
+  assert.ok(Math.abs(delta.points.readFloatLE(POINT_STRIDE_BYTES) - 0.81) < 1e-6);
+  const coarseDelta = chunkStore.deriveChunk('delta', '0_0_0', 1, undefined, coarse.version);
+  assert.deepEqual([n(coarseDelta.points), coarseDelta.version, coarseDelta.total], [1, 5, 3], 'only the new 8 cm cell is sent');
+  assert.equal(key.total + n(delta.points), delta.total, 'finest: holder count + delta == total');
+  assert.equal(coarse.total + n(coarseDelta.points), coarseDelta.total, 'coarse: holder count + delta == total');
+
+  // With a filter, a voxel that starts passing (2nd hit) is not "new" by index: the
+  // totals disagree, which is the server's cue to send a keyframe.
+  const filter = { minHits: 2, minRatio: 0 };
+  const filteredKey = chunkStore.deriveChunk('delta', '0_0_0', finest, filter);
+  assert.deepEqual([n(filteredKey.points), filteredKey.total], [1, 1], 'only the twice-hit voxel passes');
+  storeBatch([[0.052, 0.012, 0.012]]); // second hit on voxel #1
+  const filteredDelta = chunkStore.deriveChunk('delta', '0_0_0', finest, filter, filteredKey.version);
+  assert.equal(n(filteredDelta.points), 0);
+  assert.equal(filteredDelta.total, 2);
+  assert.notEqual(filteredKey.total + n(filteredDelta.points), filteredDelta.total, 'divergence detected');
+
+  // Same answers from disk (the .bin keeps insertion order; the filter path reads .acc).
+  chunkStore.flushAll();
+  const fromDisk = chunkStore.deriveChunk('delta', '0_0_0', finest, undefined, 3);
+  assert.deepEqual([n(fromDisk.points), fromDisk.version, fromDisk.total], [2, 5, 5]);
+  const fromDiskFiltered = chunkStore.deriveChunk('delta', '0_0_0', finest, filter);
+  assert.equal(fromDiskFiltered.total, 2);
+  chunkStore.close();
+});

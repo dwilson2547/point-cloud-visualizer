@@ -209,13 +209,35 @@ Each rung is independently reviewable and (for the server logic) unit-testable:
   picking up newly-visible changed chunks and dropping ones that left the view. Verified: under a
   static camera the base grew 25.6k→75.6k pts (36→80 chunks) while the publisher streamed.
 
+- **2b-6 — base-layer deltas. Done.** A chunk's voxels are append-only and kept in insertion
+  order both in memory and in its `.bin`/`.acc`, so a viewer's *version* of a chunk is simply the
+  fine voxel count it last saw. `ChunkStore.deriveChunk(…, sinceVersion)` returns the voxels
+  added since (at the finest level the tail of that order; at a coarser level only cells whose
+  first fine voxel is new — a new fine voxel joining an existing cell nudges its mean and is not
+  re-sent) plus `total`, the full point count at that level. The server keeps
+  `{level, version, count, keyframeVersion}` per viewer per chunk and on a refresh sends
+  `chunk_delta` (append) instead of `chunk_lod` (replace), falling back to a keyframe when the
+  level changes, when `count + delta ≠ total` (voxels newly passing the observation filter), or
+  when the chunk has doubled since its last keyframe so early voxel means, which move most, get
+  re-sent — a geometric cadence that bounds keyframe bytes at ~2× the final chunk. The viewer
+  appends into a growable per-chunk buffer and keeps bounds from the used range only. The
+  refresh tick default dropped from 500 ms to 250 ms since a refresh is now cheap.
+
+  Measured with `npm run meter:viewer` on the synthetic room at VLP-16 density, 12 s of a 10 Hz
+  walk, one viewer holding the whole scene: keyframes 4.46 MB (307), deltas 2.38 MB (3060); the
+  same 3060 refreshes as whole-chunk re-sends would have been 112 MB (56 MB at the old 500 ms
+  tick). The live overlay was 36.8 MB over the same window and is now the dominant per-viewer
+  stream; culling it per viewer, or making it optional, is the next lever, followed by the
+  quantised wire format.
+
 ## Status / recommendation
 
 - **2a — done.** Voxel fusion landed; density bounded; serving path unchanged.
-- **2b — done (2b-1 → 2b-5).** Mip-per-chunk LOD derived on demand from the fine grid; view-driven
+- **2b — done (2b-1 → 2b-6).** Mip-per-chunk LOD derived on demand from the fine grid; view-driven
   serving (`viewer_view` → `chunk_lod`/`chunk_drop` diffs) with frustum/range culling; two-layer
   viewer (per-chunk base + reused live-ring overlay); live base refresh so the accumulated cloud
-  grows without camera motion. Additive octree remains a deferred bandwidth optimization.
+  grows without camera motion; refreshes as append-only `chunk_delta`s. The additive-octree
+  bandwidth argument is largely moot now that refreshes only carry new voxels.
 
 ## Open questions
 

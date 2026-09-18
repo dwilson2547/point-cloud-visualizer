@@ -183,6 +183,23 @@ export interface ChunkLodMessage {
   session_id: string;
   chunk_key: string;
   level: number;
+  // The chunk's fine voxel count this keyframe reflects; deltas continue from it.
+  version: number;
+  point_count: number;
+  point_format: string;
+  stride_bytes: number;
+}
+
+// Appends points to a chunk the viewer already holds at this level (a keyframe sent
+// earlier by chunk_lod). Fused chunks only ever gain voxels, so a refresh is the new
+// voxels since the viewer's version rather than the whole chunk again; the server
+// falls back to a keyframe when the viewer's content would otherwise diverge.
+export interface ChunkDeltaMessage {
+  type: 'chunk_delta';
+  session_id: string;
+  chunk_key: string;
+  level: number;
+  version: number;
   point_count: number;
   point_format: string;
   stride_bytes: number;
@@ -213,6 +230,7 @@ export type ServerMessage =
   | ChunkUpdateMessage
   | ChunkBootstrapMessage
   | ChunkLodMessage
+  | ChunkDeltaMessage
   | ChunkDropMessage
   | SessionRebuiltMessage;
 

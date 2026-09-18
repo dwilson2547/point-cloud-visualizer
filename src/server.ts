@@ -14,6 +14,7 @@ import {
   makeError,
   parseClientMessage,
   type ChunkBootstrapMessage,
+  type ChunkDeltaMessage,
   type ChunkDropMessage,
   type ChunkLodMessage,
   type ChunkUpdateMessage,
@@ -45,10 +46,21 @@ interface ConnectionState {
   // chunk_key (so a view update sends just the diffs) and the last frustum (so live
   // refresh can re-evaluate a changed chunk against this viewer's current camera).
   lodMode?: boolean;
-  sentLevels?: Map<string, number>;
+  sent?: Map<string, SentChunk>;
   frustum?: Frustum;
   lastViewAt?: number;
   filter?: ObservationFilter;
+}
+
+// What an LOD viewer holds for one chunk: the level, the chunk version (fine voxel
+// count) its content reflects, how many points it has, and the version at its last
+// keyframe (a chunk that doubles since then gets a fresh keyframe so early voxel
+// means, which move most, are re-sent).
+interface SentChunk {
+  level: number;
+  version: number;
+  count: number;
+  keyframeVersion: number;
 }
 
 class StorageOperationError extends Error {
@@ -89,7 +101,7 @@ const viewerStates = new Map<WebSocket, ConnectionState>();
 // Chunk keys changed by ingest since the last refresh tick, per session. Coalesces a
 // burst of batches into one re-send per chunk per tick.
 const dirtyChunksBySession = new Map<string, Set<string>>();
-const liveRefreshMs = parseIntegerEnv(process.env.LIVE_REFRESH_MS, 500);
+const liveRefreshMs = parseIntegerEnv(process.env.LIVE_REFRESH_MS, 250);
 // Incremental checkpoint: every tick, rewrite at most this many dirty chunk files so
 // the replay-on-restart window stays short without ever stalling ingest for a full
 // cache rewrite (see docs/batch-log.md).
@@ -293,7 +305,7 @@ function notifySessionRebuilt(sessionId: string, rebuilt: RebuildResult): void {
   const viewers = viewerSockets.get(sessionId);
   if (viewers) {
     for (const ws of viewers) {
-      viewerStates.get(ws)?.sentLevels?.clear();
+      viewerStates.get(ws)?.sent?.clear();
       send(ws, { type: 'session_rebuilt', session_id: sessionId, ...rebuilt });
     }
   }
@@ -502,7 +514,7 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
 }
 
 function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMode = false): void {
-  const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sentLevels: new Map() };
+  const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sent: new Map() };
   viewerStates.set(ws, state);
   ws.on('error', (error) => {
     console.error(`Viewer WebSocket error: ${error.message}`);
@@ -537,17 +549,23 @@ function configureViewerSocket(ws: WebSocket, sessionIdFromQuery?: string, lodMo
   });
 
   if (sessionIdFromQuery) {
-    attachViewer(ws, state, {
-      type: 'viewer_join',
-      session_id: sessionIdFromQuery,
-    });
+    try {
+      attachViewer(ws, state, {
+        type: 'viewer_join',
+        session_id: sessionIdFromQuery,
+      });
+    } catch (error) {
+      // An unknown session must not take the server down: tell the viewer and close.
+      send(ws, makeError('unknown_session', getErrorMessage(error), true, sessionIdFromQuery));
+      ws.close(1008, getErrorMessage(error));
+    }
   }
 }
 
 function attachViewer(ws: WebSocket, state: ConnectionState, message: ViewerJoinMessage): void {
   if (state.sessionId && state.sessionId !== message.session_id) {
     detachViewer(ws, state.sessionId);
-    state.sentLevels?.clear();
+    state.sent?.clear();
     state.frustum = undefined;
   }
   state.sessionId = message.session_id;
@@ -645,7 +663,7 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
   }
   state.lastViewAt = now;
   state.sessionId = message.session_id;
-  const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
+  const sent = state.sent ?? (state.sent = new Map());
   const frustum = buildFrustum(toViewCamera(message));
   state.frustum = frustum; // remembered so live refresh can re-evaluate changed chunks
   const filter = toObservationFilter(message);
@@ -653,7 +671,7 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
     // A different filter changes every chunk's content: forget what was sent so the
     // loop below re-sends (or drops) each visible chunk.
     state.filter = filter;
-    sentLevels.clear();
+    sent.clear();
   }
 
   const visible = new Set<string>();
@@ -663,16 +681,16 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
       continue; // culled
     }
     visible.add(cell.chunkKey);
-    if (sentLevels.get(cell.chunkKey) === level) {
+    if (sent.get(cell.chunkKey)?.level === level) {
       continue; // already at this level — no re-send on a camera nudge
     }
-    sendChunkAtLevel(ws, message.session_id, cell.chunkKey, level, sentLevels, state.filter);
+    sendChunkKeyframe(ws, message.session_id, cell.chunkKey, level, sent, state.filter);
   }
 
-  for (const chunkKey of [...sentLevels.keys()]) {
+  for (const chunkKey of [...sent.keys()]) {
     if (!visible.has(chunkKey)) {
       sendChunkDrop(ws, message.session_id, chunkKey);
-      sentLevels.delete(chunkKey);
+      sent.delete(chunkKey);
     }
   }
 }
@@ -724,24 +742,55 @@ function refreshLiveBases(): void {
   }
 }
 
-// Re-evaluate one changed chunk against a viewer's current frustum: send it at the
-// selected level (always, since its data changed) or drop it if it left the view.
+// Re-evaluate one changed chunk against a viewer's current frustum: drop it if it left
+// the view, send a keyframe if the level changed or the viewer holds nothing, else
+// send just the voxels added since the viewer's version.
 function refreshChunkForViewer(
   ws: WebSocket,
   state: ConnectionState,
   sessionId: string,
   cell: ChunkCell,
 ): void {
-  const sentLevels = state.sentLevels ?? (state.sentLevels = new Map());
+  const sent = state.sent ?? (state.sent = new Map());
   const level = selectChunkLevel(cellAabb(cell), state.frustum!, currentLadder());
   if (level === null) {
-    if (sentLevels.has(cell.chunkKey)) {
+    if (sent.has(cell.chunkKey)) {
       sendChunkDrop(ws, sessionId, cell.chunkKey);
-      sentLevels.delete(cell.chunkKey);
+      sent.delete(cell.chunkKey);
     }
     return;
   }
-  sendChunkAtLevel(ws, sessionId, cell.chunkKey, level, sentLevels, state.filter);
+  const held = sent.get(cell.chunkKey);
+  if (!held || held.level !== level) {
+    sendChunkKeyframe(ws, sessionId, cell.chunkKey, level, sent, state.filter);
+    return;
+  }
+  const delta = chunkStore.deriveChunk(sessionId, cell.chunkKey, level, state.filter, held.version);
+  const added = delta.points.byteLength / POINT_STRIDE_BYTES;
+  const diverged = delta.total !== held.count + added;
+  const settled = delta.version >= 2 * Math.max(held.keyframeVersion, 1);
+  if (diverged || settled) {
+    sendChunkKeyframe(ws, sessionId, cell.chunkKey, level, sent, state.filter);
+    return;
+  }
+  if (added === 0) {
+    held.version = delta.version;
+    return;
+  }
+  const message: ChunkDeltaMessage = {
+    type: 'chunk_delta',
+    session_id: sessionId,
+    chunk_key: cell.chunkKey,
+    level,
+    version: delta.version,
+    point_count: added,
+    point_format: POINT_FORMAT,
+    stride_bytes: POINT_STRIDE_BYTES,
+  };
+  if (sendPair(ws, message, delta.points)) {
+    held.version = delta.version;
+    held.count = delta.total;
+  }
 }
 
 function currentLadder(): LodLadder {
@@ -756,28 +805,28 @@ function cellAabb(cell: ChunkCell): Aabb {
   };
 }
 
-// Derive a chunk at a level and send it, recording the sent level. No-op for an empty
-// chunk (leaves any prior sent level untouched).
-function sendChunkAtLevel(
+// Derive a chunk in full at a level and send it as a keyframe, recording what the
+// viewer now holds. An empty derivation drops the chunk from the viewer instead.
+function sendChunkKeyframe(
   ws: WebSocket,
   sessionId: string,
   chunkKey: string,
   level: number,
-  sentLevels: Map<string, number>,
+  sent: Map<string, SentChunk>,
   filter?: ObservationFilter,
 ): void {
-  const worldPoints = chunkStore.deriveChunkLevel(sessionId, chunkKey, level, filter);
-  if (worldPoints.byteLength === 0) {
+  const full = chunkStore.deriveChunk(sessionId, chunkKey, level, filter);
+  if (full.points.byteLength === 0) {
     // Nothing passes (an empty chunk, or the filter removed everything): make sure
     // the viewer is not left showing a stale version.
-    if (sentLevels.has(chunkKey)) {
+    if (sent.has(chunkKey)) {
       sendChunkDrop(ws, sessionId, chunkKey);
-      sentLevels.delete(chunkKey);
+      sent.delete(chunkKey);
     }
     return;
   }
-  if (sendChunkLod(ws, sessionId, chunkKey, level, worldPoints)) {
-    sentLevels.set(chunkKey, level);
+  if (sendChunkLod(ws, sessionId, chunkKey, level, full.version, full.points)) {
+    sent.set(chunkKey, { level, version: full.version, count: full.total, keyframeVersion: full.version });
   }
 }
 
@@ -855,6 +904,7 @@ function sendChunkLod(
   sessionId: string,
   chunkKey: string,
   level: number,
+  version: number,
   worldPoints: Buffer,
 ): boolean {
   const message: ChunkLodMessage = {
@@ -862,6 +912,7 @@ function sendChunkLod(
     session_id: sessionId,
     chunk_key: chunkKey,
     level,
+    version,
     point_count: worldPoints.byteLength / POINT_STRIDE_BYTES,
     point_format: POINT_FORMAT,
     stride_bytes: POINT_STRIDE_BYTES,

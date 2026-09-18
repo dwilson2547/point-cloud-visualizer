@@ -107,6 +107,12 @@ export interface FusedBatch {
   pose: Pose;
 }
 
+export interface ChunkDerivation {
+  points: Buffer; // 18-byte world-frame points: the full level, or only the new ones
+  version: number; // fine voxel count the derivation reflects
+  total: number; // point count of the full derivation at this level
+}
+
 export interface RebuildResult {
   batches: number; // batches re-fused
   chunks: number; // chunks rebuilt
@@ -1179,62 +1185,125 @@ export class ChunkStore {
   // Derive a chunk's points at an LOD level: the fine representatives re-binned to the
   // level's coarser grid (each fine voxel counted once — spatially uniform). Returns
   // the 18-byte world-frame point buffer ready to ship, or an empty buffer if the
-  // chunk has no data. Works whether the chunk is resident or resting on disk, since
-  // both resolve to the same fine representative buffer first.
+  // chunk has no data.
   deriveChunkLevel(sessionId: string, chunkKey: string, level: number, filter?: ObservationFilter): Buffer {
-    const fine = isFilterActive(filter)
-      ? this.readFilteredRepresentatives(sessionId, chunkKey, filter!)
-      : this.readFineRepresentatives(sessionId, chunkKey);
-    if (!fine || fine.byteLength === 0) {
-      return Buffer.alloc(0);
+    return this.deriveChunk(sessionId, chunkKey, level, filter).points;
+  }
+
+  // Derive a chunk at a level, either in full (a keyframe) or as the points added
+  // since `sinceVersion` (a delta). A chunk's version is its fine voxel count: voxels
+  // are append-only and kept in insertion order in memory and on disk, so the fine
+  // voxels at index >= version are exactly the new ones. At a coarser level a cell is
+  // new when its first fine voxel is new; a new fine voxel joining an existing cell
+  // only nudges that cell's mean and is not re-sent. `total` is the point count of the
+  // full derivation at this level, so a caller holding `count` points that receives a
+  // delta of `d` can detect divergence (e.g. voxels newly passing the filter) when
+  // count + d != total and ask for a keyframe instead.
+  deriveChunk(
+    sessionId: string,
+    chunkKey: string,
+    level: number,
+    filter?: ObservationFilter,
+    sinceVersion?: number,
+  ): ChunkDerivation {
+    const fine = this.readOrderedFine(sessionId, chunkKey, filter);
+    if (!fine || fine.count === 0) {
+      return { points: Buffer.alloc(0), version: 0, total: 0 };
     }
+    const since = sinceVersion ?? 0;
+    const { buffer, pass, count } = fine;
+
     if (level >= this.numLevels - 1) {
-      return fine; // finest level is the fused grid itself — no coarsening needed
-    }
-    return serializeRepresentatives(binPoints(fine, this.levelVoxelMeters(level)));
-  }
-
-  // Representatives of the voxels that pass the observation filter. Needs the
-  // accumulators (hits and opportunity baseline), so an on-disk chunk is read from
-  // its .acc sidecar rather than the cheaper .bin.
-  private readFilteredRepresentatives(sessionId: string, chunkKey: string, filter: ObservationFilter): Buffer | null {
-    const cell = this.cells(sessionId).get(chunkKey);
-    if (!cell) {
-      return null;
-    }
-    const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
-    const voxels = active
-      ? active.voxels
-      : this.loadAccumulators(path.join(this.chunksDir, sessionId, `${chunkKey}.acc`), cell.stats, chunkKey)?.voxels;
-    if (!voxels || voxels.size === 0) {
-      return null;
-    }
-    const passing = new Map<string, VoxelAccumulator>();
-    const opportunities = cell.stats.opportunities;
-    for (const [key, acc] of voxels) {
-      const seen = Math.max(1, opportunities - acc.o0 + 1);
-      if (acc.n >= filter.minHits && acc.n / seen >= filter.minRatio) {
-        passing.set(key, acc);
+      let total = 0;
+      let newCount = 0;
+      for (let i = 0; i < count; i++) {
+        if (pass && !pass[i]) continue;
+        total += 1;
+        if (i >= since) newCount += 1;
       }
+      const points = Buffer.allocUnsafe(newCount * POINT_STRIDE_BYTES);
+      let w = 0;
+      for (let i = Math.max(since, 0); i < count; i++) {
+        if (pass && !pass[i]) continue;
+        buffer.copy(points, w, i * POINT_STRIDE_BYTES, (i + 1) * POINT_STRIDE_BYTES);
+        w += POINT_STRIDE_BYTES;
+      }
+      return { points, version: count, total };
     }
-    return passing.size > 0 ? serializeRepresentatives(passing) : null;
+
+    const size = this.levelVoxelMeters(level);
+    const cells = new Map<string, { acc: VoxelAccumulator; first: number }>();
+    for (let i = 0; i < count; i++) {
+      if (pass && !pass[i]) continue;
+      const o = i * POINT_STRIDE_BYTES;
+      const x = buffer.readFloatLE(o);
+      const y = buffer.readFloatLE(o + 4);
+      const z = buffer.readFloatLE(o + 8);
+      const key = voxelKey(x, y, z, size);
+      let cell = cells.get(key);
+      if (!cell) {
+        cell = { acc: { sx: 0, sy: 0, sz: 0, sr: 0, sg: 0, sb: 0, si: 0, n: 0, o0: 0 }, first: i };
+        cells.set(key, cell);
+      }
+      cell.acc.sx += x;
+      cell.acc.sy += y;
+      cell.acc.sz += z;
+      cell.acc.sr += buffer[o + 12];
+      cell.acc.sg += buffer[o + 13];
+      cell.acc.sb += buffer[o + 14];
+      cell.acc.si += buffer.readUInt16LE(o + 15);
+      cell.acc.n += 1;
+    }
+    const fresh = new Map<string, VoxelAccumulator>();
+    for (const [key, cell] of cells) {
+      if (cell.first >= since) fresh.set(key, cell.acc);
+    }
+    return { points: serializeRepresentatives(fresh), version: count, total: cells.size };
   }
 
-  // The chunk's fused fine representatives (one 18-byte point per occupied fine voxel):
-  // from the in-memory voxel set if resident, else from its on-disk file.
-  private readFineRepresentatives(sessionId: string, chunkKey: string): Buffer | null {
+  // The chunk's fine representatives in insertion order (one 18-byte point per voxel)
+  // plus, when a filter is active, a pass flag per voxel. Resident chunks serialise
+  // their voxel map; on-disk chunks read the .bin (same order) or, when the filter
+  // needs hit counts, the .acc sidecar.
+  private readOrderedFine(
+    sessionId: string,
+    chunkKey: string,
+    filter?: ObservationFilter,
+  ): { buffer: Buffer; pass: Uint8Array | null; count: number } | null {
     const active = this.activeChunks.get(`${sessionId}:${chunkKey}`);
+    const filtering = isFilterActive(filter);
+    let voxels: Map<string, VoxelAccumulator> | undefined;
+    let stats: ChunkStats | undefined;
     if (active) {
-      return active.voxels.size > 0 ? serializeRepresentatives(active.voxels) : null;
-    }
-    try {
-      return fs.readFileSync(path.join(this.chunksDir, sessionId, `${chunkKey}.bin`));
-    } catch (error) {
-      if (isNotFoundError(error)) {
-        return null;
+      voxels = active.voxels;
+      stats = active.stats;
+    } else if (!filtering) {
+      try {
+        const buffer = fs.readFileSync(path.join(this.chunksDir, sessionId, `${chunkKey}.bin`));
+        return { buffer, pass: null, count: buffer.byteLength / POINT_STRIDE_BYTES };
+      } catch (error) {
+        if (isNotFoundError(error)) return null;
+        throw error;
       }
-      throw error;
+    } else {
+      const cell = this.cells(sessionId).get(chunkKey);
+      if (!cell) return null;
+      voxels = this.loadAccumulators(path.join(this.chunksDir, sessionId, `${chunkKey}.acc`), cell.stats, chunkKey)?.voxels;
+      stats = cell.stats;
     }
+    if (!voxels || voxels.size === 0) return null;
+    const buffer = serializeRepresentatives(voxels);
+    if (!filtering || !filter || !stats) {
+      return { buffer, pass: null, count: voxels.size };
+    }
+    const pass = new Uint8Array(voxels.size);
+    const opportunities = stats.opportunities;
+    let i = 0;
+    for (const acc of voxels.values()) {
+      const seen = Math.max(1, opportunities - acc.o0 + 1);
+      pass[i++] = acc.n >= filter.minHits && acc.n / seen >= filter.minRatio ? 1 : 0;
+    }
+    return { buffer, pass, count: voxels.size };
   }
 
   private initializeSchema(): void {

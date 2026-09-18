@@ -130,47 +130,110 @@ function ingestOverlay(header, buffer) {
 }
 
 // ------------------------------------------------------------- LOD base layer
-// One THREE.Points per chunk_key, replaced whole on chunk_lod and disposed on
-// chunk_drop. Frustum-culled per object (draw-cost win) since each spans one chunk.
-const baseChunks = new Map(); // chunk_key -> THREE.Points (userData.count)
+// One THREE.Points per chunk_key with a growable buffer: chunk_lod replaces it (a
+// keyframe), chunk_delta appends the voxels added since, chunk_drop disposes it.
+// Frustum-culled per object (draw-cost win) since each spans one chunk.
+const baseChunks = new Map(); // chunk_key -> { points, positions, colors, count, capacity, box }
 let basePointCount = 0;
+
+function decodePoints(buffer, count, positions, colors, offset) {
+  const view = new DataView(buffer);
+  for (let i = 0; i < count; i++) {
+    const o = i * STRIDE;
+    const p = (offset + i) * 3;
+    positions[p] = view.getFloat32(o, true); // already world-frame
+    positions[p + 1] = view.getFloat32(o + 4, true);
+    positions[p + 2] = view.getFloat32(o + 8, true);
+    colors[p] = view.getUint8(o + 12);
+    colors[p + 1] = view.getUint8(o + 13);
+    colors[p + 2] = view.getUint8(o + 14);
+  }
+}
+
+function extendBox(box, positions, from, to) {
+  for (let i = from; i < to; i++) {
+    box.expandByPoint(t.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]));
+  }
+}
+
+function attachBuffers(entry) {
+  const geometry = entry.points.geometry;
+  const posAttr = new THREE.BufferAttribute(entry.positions, 3);
+  const colAttr = new THREE.BufferAttribute(entry.colors, 3, true);
+  posAttr.setUsage(THREE.DynamicDrawUsage);
+  colAttr.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute('color', colAttr);
+}
+
+function updateBounds(entry) {
+  const geometry = entry.points.geometry;
+  geometry.setDrawRange(0, entry.count);
+  // Bounds from the used range only: the spare capacity is zeros at the origin and
+  // would otherwise inflate the bounding sphere used for culling.
+  geometry.boundingBox = entry.box.clone();
+  geometry.boundingSphere = entry.box.getBoundingSphere(new THREE.Sphere());
+  bounds.union(entry.box);
+}
 
 function ingestBaseChunk(header, buffer) {
   const count = header.point_count;
-  const view = new DataView(buffer);
-  const positions = new Float32Array(count * 3);
-  const colors = new Uint8Array(count * 3);
-  for (let i = 0; i < count; i++) {
-    const o = i * STRIDE;
-    positions[i * 3] = view.getFloat32(o, true); // already world-frame
-    positions[i * 3 + 1] = view.getFloat32(o + 4, true);
-    positions[i * 3 + 2] = view.getFloat32(o + 8, true);
-    colors[i * 3] = view.getUint8(o + 12);
-    colors[i * 3 + 1] = view.getUint8(o + 13);
-    colors[i * 3 + 2] = view.getUint8(o + 14);
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3, true));
-  geometry.computeBoundingBox();
-  geometry.computeBoundingSphere(); // needed for per-object frustum culling
-  if (geometry.boundingBox) bounds.union(geometry.boundingBox);
-
   disposeBaseChunk(header.chunk_key);
-  const points = new THREE.Points(geometry, material);
-  points.userData.count = count;
-  baseChunks.set(header.chunk_key, points);
-  scene.add(points);
+  const capacity = Math.max(64, Math.ceil(count * 1.5));
+  const entry = {
+    points: new THREE.Points(new THREE.BufferGeometry(), material),
+    positions: new Float32Array(capacity * 3),
+    colors: new Uint8Array(capacity * 3),
+    count,
+    capacity,
+    box: new THREE.Box3().makeEmpty(),
+  };
+  decodePoints(buffer, count, entry.positions, entry.colors, 0);
+  extendBox(entry.box, entry.positions, 0, count);
+  attachBuffers(entry);
+  updateBounds(entry);
+  baseChunks.set(header.chunk_key, entry);
+  scene.add(entry.points);
   basePointCount += count;
+  stats.keyframeBytes += buffer.byteLength;
+}
+
+function appendBaseChunk(header, buffer) {
+  const entry = baseChunks.get(header.chunk_key);
+  if (!entry) {
+    ingestBaseChunk(header, buffer); // never saw the keyframe: treat as one
+    return;
+  }
+  const added = header.point_count;
+  const needed = entry.count + added;
+  if (needed > entry.capacity) {
+    const capacity = Math.max(needed, entry.capacity * 2);
+    const positions = new Float32Array(capacity * 3);
+    const colors = new Uint8Array(capacity * 3);
+    positions.set(entry.positions.subarray(0, entry.count * 3));
+    colors.set(entry.colors.subarray(0, entry.count * 3));
+    entry.positions = positions;
+    entry.colors = colors;
+    entry.capacity = capacity;
+    attachBuffers(entry);
+  }
+  decodePoints(buffer, added, entry.positions, entry.colors, entry.count);
+  extendBox(entry.box, entry.positions, entry.count, needed);
+  const geometry = entry.points.geometry;
+  geometry.getAttribute('position').needsUpdate = true;
+  geometry.getAttribute('color').needsUpdate = true;
+  entry.count = needed;
+  updateBounds(entry);
+  basePointCount += added;
+  stats.deltaBytes += buffer.byteLength;
 }
 
 function disposeBaseChunk(chunkKey) {
   const existing = baseChunks.get(chunkKey);
   if (!existing) return;
-  scene.remove(existing);
-  existing.geometry.dispose();
-  basePointCount -= existing.userData.count ?? 0;
+  scene.remove(existing.points);
+  existing.points.geometry.dispose();
+  basePointCount -= existing.count;
   baseChunks.delete(chunkKey);
 }
 
@@ -212,7 +275,7 @@ function connect(sessionId) {
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'chunk_update' || msg.type === 'chunk_bootstrap' || msg.type === 'chunk_lod') {
+      if (msg.type === 'chunk_update' || msg.type === 'chunk_bootstrap' || msg.type === 'chunk_lod' || msg.type === 'chunk_delta') {
         pendingHeader = msg; // binary payload follows next
       } else if (msg.type === 'chunk_drop') {
         disposeBaseChunk(msg.chunk_key);
@@ -235,6 +298,8 @@ function connect(sessionId) {
     if (!header) return;
     if (header.type === 'chunk_lod') {
       ingestBaseChunk(header, ev.data);
+    } else if (header.type === 'chunk_delta') {
+      appendBaseChunk(header, ev.data);
     } else {
       ingestOverlay(header, ev.data); // chunk_update or chunk_bootstrap
     }
@@ -251,6 +316,8 @@ function resetCloud() {
   stats.batches = 0;
   stats.windowPoints = 0;
   stats.lastSeq = '—';
+  stats.keyframeBytes = 0;
+  stats.deltaBytes = 0;
 }
 
 // -------------------------------------------------------------- view reporting
@@ -302,8 +369,9 @@ const els = {
   batches: document.getElementById('s-batches'),
   rate: document.getElementById('s-rate'),
   seq: document.getElementById('s-seq'),
+  base: document.getElementById('s-base'),
 };
-const stats = { batches: 0, lastSeq: '—', windowPoints: 0 };
+const stats = { batches: 0, lastSeq: '—', windowPoints: 0, keyframeBytes: 0, deltaBytes: 0 };
 let firstData = true;
 
 function setStatus(text, on) {
@@ -334,6 +402,7 @@ function animate() {
   els.points.textContent = total.toLocaleString();
   els.batches.textContent = String(baseChunks.size);
   els.seq.textContent = String(stats.lastSeq);
+  els.base.textContent = `${(stats.keyframeBytes / 1e6).toFixed(1)} MB key + ${(stats.deltaBytes / 1e6).toFixed(1)} MB delta`;
 }
 animate();
 

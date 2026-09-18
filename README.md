@@ -74,6 +74,8 @@ The repository now includes a first-pass TypeScript server with:
 - bounded dirty chunk buffers with flush-on-threshold, cache pressure, and session close
 - bounded in-memory pose tracking
 - live viewer fan-out of accepted point batches
+- view-driven LOD base layer refreshed by append-only deltas (`npm run meter:viewer` measures a
+  viewer's keyframe, delta and overlay bytes)
 
 This is still a scaffold, but storage is now disk-backed. The live write path appends each raw
 batch to the session log, then partitions its points into fixed world chunks and fuses them into
@@ -105,7 +107,9 @@ The chunk store is configurable by environment variables:
 - `MAX_RETAINED_POSES` — recent poses retained per active session (default: `64`)
 - `MAX_VIEWER_BUFFERED_BYTES` — disconnect viewers that stop consuming before their outbound queue
   exceeds this limit (default: `33554432`)
-- `LIVE_REFRESH_MS` — coalescing interval for refreshing changed LOD chunks (default: `500`)
+- `LIVE_REFRESH_MS` — coalescing interval for refreshing changed LOD chunks (default: `250`);
+  refreshes send only the voxels added since the viewer's version (`chunk_delta`), with periodic
+  keyframes
 - `CHECKPOINT_TICK_MS` — how often the incremental checkpoint runs (default: `1000`)
 - `CHECKPOINT_CHUNKS_PER_TICK` — chunk files one checkpoint tick may rewrite (default: `8`)
 - `REFUSE_TOLERANCE_M` — a pose correction smaller than this does not re-fuse its batch (default:
