@@ -27,10 +27,20 @@ import {
 } from './protocol.js';
 import { ChunkStore, DurableBatchError, type ObservationFilter, type RebuildResult } from './chunk-store.js';
 import { validatePoseCorrections } from './pose-corrections.js';
-import { INGEST_FORMATS, SERVE_FORMATS, SERVE_FORMAT_Q8, Q8_STEPS, Q8_STRIDE_BYTES, encodeQ8Chunk } from './point-formats.js';
+import {
+  INGEST_FORMATS,
+  SERVE_FORMATS,
+  SERVE_FORMAT_Q8,
+  Q8_STEPS,
+  Q8_STRIDE_BYTES,
+  encodeQ8Chunk,
+  selectRows,
+  worldPositions,
+} from './point-formats.js';
 import { SessionStore } from './session-store.js';
 import {
   buildFrustum,
+  frustumContainsPoint,
   selectChunkLevel,
   type Aabb,
   type Frustum,
@@ -53,6 +63,9 @@ interface ConnectionState {
   filter?: ObservationFilter;
   // Served point format for this viewer's base layer (?fmt=; default xyz_rgb_i_v1).
   serveFormat?: string;
+  // Live overlay: off, or culled to this viewer's frustum and capped per batch (0 = no cap).
+  overlay: boolean;
+  overlayMaxPoints: number;
 }
 
 // What an LOD viewer holds for one chunk: the level, the chunk version (fine voxel
@@ -387,7 +400,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 function configureIngestSocket(ws: WebSocket): void {
-  const state: ConnectionState = { role: INGEST_ROLE };
+  const state: ConnectionState = { role: INGEST_ROLE, overlay: false, overlayMaxPoints: 0 };
   ws.on('error', (error) => {
     console.error(`Ingest WebSocket error: ${error.message}`);
   });
@@ -536,7 +549,14 @@ function configureViewerSocket(
   lodMode = false,
   serveFormat: string = POINT_FORMAT,
 ): void {
-  const state: ConnectionState = { role: VIEWER_ROLE, lodMode, sent: new Map(), serveFormat };
+  const state: ConnectionState = {
+    role: VIEWER_ROLE,
+    lodMode,
+    sent: new Map(),
+    serveFormat,
+    overlay: true,
+    overlayMaxPoints: 0,
+  };
   viewerStates.set(ws, state);
   ws.on('error', (error) => {
     console.error(`Viewer WebSocket error: ${error.message}`);
@@ -626,15 +646,51 @@ function detachViewer(ws: WebSocket, sessionId?: string): void {
   }
 }
 
+// Fan a batch out as the live overlay. A plain viewer (no frustum) gets the whole
+// batch. An LOD viewer gets only the points inside its current view — a spinning
+// lidar's batch spans the whole room, so culling has to be per point, not per batch —
+// decimated to its cap if it set one, and nothing at all if it turned the overlay off.
 function broadcastChunkUpdate(header: PointBatchHeaderMessage, payload: Buffer, pose: Pose): void {
   const viewers = viewerSockets.get(header.session_id);
   if (!viewers) {
     return;
   }
+  let world: Float32Array | null = null;
+  const keep = new Uint32Array(header.point_count);
   for (const viewer of viewers) {
-    if (viewer.readyState === viewer.OPEN) {
-      sendChunkUpdate(viewer, header, payload, pose);
+    if (viewer.readyState !== viewer.OPEN) {
+      continue;
     }
+    const state = viewerStates.get(viewer);
+    if (!state || !state.lodMode || !state.frustum) {
+      sendChunkUpdate(viewer, header, payload, pose);
+      continue;
+    }
+    if (!state.overlay) {
+      continue;
+    }
+    world ??= worldPositions(payload, header.point_format, pose);
+    let inside = 0;
+    for (let i = 0; i < header.point_count; i++) {
+      if (frustumContainsPoint(state.frustum, world[i * 3], world[i * 3 + 1], world[i * 3 + 2])) {
+        keep[inside++] = i;
+      }
+    }
+    if (inside === 0) {
+      continue;
+    }
+    let count = inside;
+    if (state.overlayMaxPoints > 0 && inside > state.overlayMaxPoints) {
+      // Even stride over the kept rows: a spin's points are ordered by azimuth, so this
+      // thins uniformly rather than dropping one side of the view.
+      const step = inside / state.overlayMaxPoints;
+      count = state.overlayMaxPoints;
+      for (let j = 0; j < count; j++) {
+        keep[j] = keep[Math.floor(j * step)];
+      }
+    }
+    const subset = count === header.point_count ? payload : selectRows(payload, header.point_format, keep, count);
+    sendChunkUpdate(viewer, { ...header, point_count: count }, subset, pose);
   }
 }
 
@@ -688,6 +744,8 @@ function onViewerView(ws: WebSocket, state: ConnectionState, message: ViewerView
   const sent = state.sent ?? (state.sent = new Map());
   const frustum = buildFrustum(toViewCamera(message));
   state.frustum = frustum; // remembered so live refresh can re-evaluate changed chunks
+  state.overlay = message.overlay !== false;
+  state.overlayMaxPoints = toOverlayCap(message);
   const filter = toObservationFilter(message);
   if (!sameFilter(filter, state.filter)) {
     // A different filter changes every chunk's content: forget what was sent so the
@@ -891,6 +949,17 @@ function toObservationFilter(message: ViewerViewMessage): ObservationFilter | un
     return undefined;
   }
   return { minHits, minRatio };
+}
+
+function toOverlayCap(message: ViewerViewMessage): number {
+  const cap = message.overlay_max_points;
+  if (cap === undefined || cap === null) {
+    return 0;
+  }
+  if (!Number.isInteger(cap) || cap < 0 || cap > 10_000_000) {
+    throw new Error('viewer_view overlay_max_points must be a non-negative integer');
+  }
+  return cap;
 }
 
 function sameFilter(a?: ObservationFilter, b?: ObservationFilter): boolean {

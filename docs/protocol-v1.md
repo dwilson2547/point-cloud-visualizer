@@ -314,17 +314,45 @@ This gives the server a deterministic resume point and avoids ambiguity during r
 
 ## Viewer messages
 
-The viewer protocol can stay simpler than the ingest protocol in v1. The minimum useful messages
-are:
+A viewer connects to `/ws/view?session_id=<id>[&lod=1][&fmt=<served format>]`. Without `lod=1` it
+is a *plain* viewer: it receives `viewer_session_state`, a `chunk_bootstrap` per persisted chunk
+(the whole accumulated cloud, 18-byte world-frame points) and every `chunk_update`. With `lod=1` it
+is an *LOD* viewer and drives its own base layer with `viewer_view`. `snapshot_ready` from the
+original draft was never implemented.
 
-- `viewer_join`
-- `viewer_session_state`
-- `chunk_update`
-- `snapshot_ready`
-- `error`
+Client → server:
 
-The server should be free to send chunk-level updates in whatever internal representation best fits
-the first backend implementation, as long as the ingest contract remains stable.
+- `viewer_join { session_id }` — alternative to the query parameter.
+- `viewer_view { session_id, position, forward, up, fov_y_rad, viewport_px, near_m, far_m,
+  filter?, overlay?, overlay_max_points? }` — sent on camera settle (the web viewer throttles to
+  ~5 Hz; the server ignores anything within 100 ms of the last). `filter` is the observation
+  filter `{ min_hits, min_ratio }` ([`observation-filter.md`](./observation-filter.md)).
+  `overlay: false` turns the live overlay off for this viewer; `overlay_max_points` caps it per
+  batch (0 = uncapped).
+
+Server → client (a binary payload follows each of `chunk_bootstrap`, `chunk_update`, `chunk_lod`
+and `chunk_delta`):
+
+- `viewer_session_state` — counters at join.
+- `chunk_update` — one accepted batch in the publisher's wire format, local frame, with the pose
+  it was fused with (corrected if corrections are installed). For an LOD viewer it is culled per
+  point to the viewer's frustum and decimated to its cap; a batch with nothing in view is not sent.
+- `chunk_lod { chunk_key, level, version, point_count, point_format, stride_bytes, origin?,
+  quantum? }` — a keyframe: replace this chunk with these points at this level.
+- `chunk_delta { … same fields … }` — append these points to the chunk the viewer holds.
+- `chunk_drop { chunk_key }` — the chunk left the view; free it.
+- `session_rebuilt { batches, chunks }` — pose corrections changed; drop everything and re-request.
+- `error`.
+
+The base layer is served in `xyz_rgb_i_v1` unless the viewer asked for `q8_chunk_v2`.
+
+## HTTP
+
+- `GET /healthz`, `GET /storage`, `GET /sessions` (each session includes `log` counters),
+  `GET /sessions/:id/chunks` (persisted chunks with hit/opportunity counters).
+- `GET /sessions/:id/log` — the raw batch log; `Range: bytes=N-` for tailing, 416 when nothing new.
+- `GET | PUT | DELETE /sessions/:id/pose-corrections`, `POST /sessions/:id/rebuild` — the
+  alignment layer ([`alignment.md`](./alignment.md)).
 
 ## Validation rules
 
@@ -343,6 +371,8 @@ The server should reject or flag:
 - batches exceeding the configured point limit
 - batches spanning more than the configured spatial chunk limit
 - invalid viewer camera/FOV/viewport ranges
+- an observation filter outside `min_hits ≥ 1`, `0 ≤ min_ratio ≤ 1`, or a negative overlay cap
+- an unknown served format on the viewer upgrade
 
 ## Flow control
 

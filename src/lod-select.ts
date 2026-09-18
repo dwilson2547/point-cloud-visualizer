@@ -141,6 +141,16 @@ export function frustumContainsAabb(frustum: Frustum, aabb: Aabb): boolean {
   return true;
 }
 
+// Point-in-frustum: inside every inward-facing plane.
+export function frustumContainsPoint(frustum: Frustum, x: number, y: number, z: number): boolean {
+  for (const plane of frustum.planes) {
+    if (plane.n[0] * x + plane.n[1] * y + plane.n[2] * z + plane.d < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Shortest distance from a point to an AABB (0 when inside).
 export function nearestDistanceToAabb(point: Vec3, aabb: Aabb): number {
   const dx = Math.max(aabb.min[0] - point[0], 0, point[0] - aabb.max[0]);

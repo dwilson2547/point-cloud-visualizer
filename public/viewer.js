@@ -374,6 +374,10 @@ function sendView() {
         min_hits: Math.max(1, Number.parseInt(els.minHits.value, 10) || 1),
         min_ratio: Math.min(1, Math.max(0, Number.parseFloat(els.minRatio.value) || 0)),
       },
+      // Live overlay: the server culls each batch to this view; the cap thins it further
+      // for slow links (0 = uncapped).
+      overlay: els.overlay.checked,
+      overlay_max_points: Math.max(0, Number.parseInt(els.overlayMax.value, 10) || 0),
     }),
   );
   viewDirty = false;
@@ -390,6 +394,8 @@ setInterval(() => {
 
 // ------------------------------------------------------------------------ HUD
 const els = {
+  overlay: document.getElementById('overlay'),
+  overlayMax: document.getElementById('overlay-max'),
   minHits: document.getElementById('min-hits'),
   minRatio: document.getElementById('min-ratio'),
   status: document.getElementById('status'),
@@ -451,7 +457,7 @@ document.getElementById('connect').addEventListener('click', () => {
   connect(sessionInput.value.trim());
 });
 document.getElementById('recenter').addEventListener('click', recenter);
-for (const input of [els.minHits, els.minRatio]) {
+for (const input of [els.minHits, els.minRatio, els.overlay, els.overlayMax]) {
   input.addEventListener('change', () => {
     viewDirty = true; // next view update carries the new filter; the server re-sends
   });

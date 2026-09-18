@@ -230,8 +230,20 @@ Each rung is independently reviewable and (for the server logic) unit-testable:
   stream; culling it per viewer, or making it optional, is the next lever.
 
   With the quantised formats (`docs/protocol-v1.md`: `xyzi_q4_v2` in, `q8_chunk_v2` out) the same
-  scenario metered 1.25 MB keyframes + 0.62 MB deltas and a 5.85 MB overlay over 12 s, and
-  permessage-deflate would halve the keyframes again (0.62 MB) and take the deltas to 0.40 MB.
+  scenario metered 1.25 MB keyframes + 0.62 MB deltas over 12 s, and permessage-deflate would
+  halve the keyframes again (0.62 MB) and take the deltas to 0.40 MB. Overlay bytes are best read
+  per batch, since the 12 s windows did not always catch the same number of batches: 518 KB per
+  spin in `xyz_rgb_i_v1`, 202 KB in `xyzi_q4_v2`, before culling.
+
+- **2b-7 — overlay culled per viewer. Done.** Each batch is transformed to the world frame once
+  and every LOD viewer receives only the rows inside its frustum (`frustumContainsPoint`), thinned
+  to `overlay_max_points` if set, or nothing if it sent `overlay: false`. Whole-batch culling by
+  bounding box would have done nothing: a spinning lidar's batch spans the room. Metered on the
+  same scenario, a viewer looking down at the whole room still received 100 % of the points
+  (14.3 MB over 12 s at 7 B/point; the sensor is inside the room, so everything is in view), while
+  a viewer standing in a corner looking along one wall received 30 % (4.3 MB). The overlay is
+  therefore now proportional to what the viewer looks at, and a remote viewer can cap or drop it
+  and rely on the 250 ms delta refresh instead.
 
 ## Status / recommendation
 

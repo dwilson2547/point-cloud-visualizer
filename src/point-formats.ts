@@ -7,7 +7,8 @@
 //   xyzi_q4_v2     7 B  i16 x,y,z at 4 mm (±131 m) · u8 intensity       (ingest)
 //   q8_chunk_v2    7 B  u8 x,y,z relative to the chunk origin in units of
 //                       chunk_size/256 · u8 r,g,b · u8 intensity         (serve)
-import { POINT_FORMAT, POINT_STRIDE_BYTES } from './protocol.js';
+import { POINT_FORMAT, POINT_STRIDE_BYTES, type Pose } from './protocol.js';
+import { rotateVector } from './pose-corrections.js';
 
 export const INGEST_FORMAT_Q4 = 'xyzi_q4_v2';
 export const SERVE_FORMAT_Q8 = 'q8_chunk_v2';
@@ -115,6 +116,39 @@ export function decodeQ8Chunk(payload: Buffer, origin: [number, number, number],
     out[w + 14] = payload[o + 5];
     out.writeUInt16LE(payload[o + 6] << 8, w + 15);
     out[w + 17] = 0;
+  }
+  return out;
+}
+
+// World-frame xyz of every point in an ingest payload, for per-viewer culling of the
+// live overlay. The payload itself is left in its wire format (rows are copied through
+// unchanged, so the viewer still applies the pose).
+export function worldPositions(payload: Buffer, format: string, pose: Pose): Float32Array {
+  const stride = ingestStride(format);
+  const count = payload.byteLength / stride;
+  const out = new Float32Array(count * 3);
+  const q = pose.rotation_xyzw;
+  const [tx, ty, tz] = pose.translation_m;
+  const q4 = format === INGEST_FORMAT_Q4;
+  for (let i = 0; i < count; i++) {
+    const o = i * stride;
+    const local: [number, number, number] = q4
+      ? [payload.readInt16LE(o) * Q4_METERS, payload.readInt16LE(o + 2) * Q4_METERS, payload.readInt16LE(o + 4) * Q4_METERS]
+      : [payload.readFloatLE(o), payload.readFloatLE(o + 4), payload.readFloatLE(o + 8)];
+    const [x, y, z] = rotateVector(q, local);
+    out[i * 3] = x + tx;
+    out[i * 3 + 1] = y + ty;
+    out[i * 3 + 2] = z + tz;
+  }
+  return out;
+}
+
+// Copy the rows listed in `keep` (point indices) out of a payload into a new one.
+export function selectRows(payload: Buffer, format: string, keep: Uint32Array, count: number): Buffer {
+  const stride = ingestStride(format);
+  const out = Buffer.allocUnsafe(count * stride);
+  for (let i = 0; i < count; i++) {
+    payload.copy(out, i * stride, keep[i] * stride, keep[i] * stride + stride);
   }
   return out;
 }

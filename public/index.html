@@ -59,6 +59,11 @@
       <input id="min-hits" type="number" min="1" step="1" value="1" class="num" />
       <label for="min-ratio" title="hide voxels whose hits / opportunities ratio is below this">min ratio</label>
       <input id="min-ratio" type="number" min="0" max="1" step="0.05" value="0" class="num" />
+      <span class="sep"></span>
+      <label for="overlay" title="stream the newest batches, culled to this view">overlay</label>
+      <input id="overlay" type="checkbox" checked />
+      <label for="overlay-max" title="cap overlay points per batch for this viewer (0 = uncapped)">max pts</label>
+      <input id="overlay-max" type="number" min="0" step="1000" value="0" class="num" />
     </div>
     <script type="module" src="./viewer.js"></script>
   </body>

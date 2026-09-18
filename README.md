@@ -1,14 +1,16 @@
 ---
 tier: project
 domain: tools
-status: design
+status: active
 ---
 
 # point-cloud-visualizer
 
-A Potree-based point cloud visualization and streaming backend project for accepting client-produced
-point clouds plus pose/odometry updates, persisting a mutable world model, and serving both
-real-time updates and static viewer-friendly snapshots.
+A live point cloud streaming server and viewer. Publishers stream point batches plus pose/odometry
+over WebSocket; the server logs every batch, fuses it into a bounded voxel world model, and serves
+viewers a view-driven, level-of-detail base layer plus a low-latency live overlay. A Python sidecar
+closes loops in the odometry after the fact and the server re-fuses from its log. The viewer is a
+small Three.js page; Potree is a reference in `../potree/`, not a dependency.
 
 ## Goals
 
@@ -20,22 +22,24 @@ real-time updates and static viewer-friendly snapshots.
 - Track recordings by negotiated session ID so multiple capture sessions can be persisted and
   resumed cleanly.
 
-## Initial direction
+## Shape
 
-The current direction is a hybrid architecture:
+1. **Ingest** point batches, pose/odometry and session metadata over WebSocket
+   ([`docs/protocol-v1.md`](docs/protocol-v1.md)).
+2. **Log** every batch as sent to a per-session append-only log; ack after one fsync
+   ([`docs/batch-log.md`](docs/batch-log.md)).
+3. **Fuse** into per-chunk voxel accumulators with hit and opportunity counts; chunk files are a
+   checkpointed cache of the log ([`docs/phase-2-voxel-fusion-lod.md`](docs/phase-2-voxel-fusion-lod.md),
+   [`docs/observation-filter.md`](docs/observation-filter.md)).
+4. **Serve** a view-driven LOD base layer refreshed by append-only deltas, plus a live overlay
+   culled per viewer, in quantised formats.
+5. **Align** after the fact: a pose graph with ICP-verified loop closures installs corrected poses
+   and the server re-fuses only what moved ([`docs/alignment.md`](docs/alignment.md)).
 
-1. **Ingest** client-provided point batches, pose/odometry, and session metadata over a streaming
-   API.
-2. **Fuse** updates into a mutable spatial store on the server.
-3. **Serve** live chunk/delta updates to clients.
-4. **Publish** periodic static snapshots in a Potree-friendly format for cold-start and archival.
-
-This keeps Potree useful as a visualization layer while avoiding the need to treat its static octree
-format as the live source of truth.
-
-For the first version, the backend does **not** assume responsibility for SLAM or Point-LIO style
-pose estimation. Clients are expected to provide already-registered points and updated pose data.
-Direct sensor-to-server ingestion can remain a stretch goal.
+Publishers own odometry (the KISS-ICP client does scan matching on the sensor side); the server's
+alignment layer corrects it rather than replacing it. Potree-format snapshot export from the
+original plan has not been built and is not currently planned; the decisions that shaped the
+current design are recorded in [`docs/decisions/`](docs/decisions/).
 
 ## Project docs
 
@@ -49,11 +53,14 @@ Direct sensor-to-server ingestion can remain a stretch goal.
 - [`docs/vlp16-kiss-icp.md`](docs/vlp16-kiss-icp.md) — IMU-free moving VLP-16 trial with KISS-ICP
 - [`docs/vlp16-moving-odometry.md`](docs/vlp16-moving-odometry.md) — ESP32/BMI088 + Point-LIO design
 - [`docs/vlp32-client.md`](docs/vlp32-client.md) — first-pass Velodyne VLP-32 publisher setup
+- [`docs/decisions/`](docs/decisions/) — requirement, decision and outcome nodes (`scope-creep`)
 - [`docs/notes/README.md`](docs/notes/README.md) — atomic project notes index
 
-## Current scaffold
+## What exists
 
-The repository now includes a first-pass TypeScript server with:
+A TypeScript server (`src/`), a Three.js viewer (`public/`), Velodyne and synthetic publishers
+(`src/*-client.ts`, `src/synthetic-publisher.ts`, `clients/kiss-icp/`) and the alignment sidecar
+(`alignment/`). The server provides:
 
 - `GET /healthz` for health and protocol metadata
 - `GET /storage` for chunk-store summary
@@ -78,11 +85,15 @@ The repository now includes a first-pass TypeScript server with:
   viewer's keyframe, delta and overlay bytes)
 - quantised wire formats: `xyzi_q4_v2` for ingest and `q8_chunk_v2` for the base layer, 7 bytes per
   point each, plus permessage-deflate on both WebSocket roles (`docs/protocol-v1.md`)
+- a live overlay culled per viewer to the points inside its view, with an opt-out and a per-batch
+  cap for slow links (viewer controls: overlay, max pts)
+- an observation filter at serve time (viewer controls: min hits, min ratio)
 
-This is still a scaffold, but storage is now disk-backed. The live write path appends each raw
-batch to the session log, then partitions its points into fixed world chunks and fuses them into
-bounded voxel representatives in memory. Chunk files are rewritten in the background by an
-incremental checkpoint, and anything not yet checkpointed is replayed from the log at startup.
+The write path appends each raw batch to the session log, then partitions its points into fixed
+world chunks and fuses them into bounded voxel representatives in memory. Chunk files are rewritten
+in the background by an incremental checkpoint, and anything not yet checkpointed is replayed from
+the log at startup. Everything has been exercised only against synthetic data and a bench-mounted
+VLP-16 (see the `vlp16-*` docs); no moving real capture has been run through alignment yet.
 
 ## Quickstart
 

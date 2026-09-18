@@ -112,18 +112,53 @@ The fastest path to a working proof of concept is:
 
 This de-risks the backend before committing to Potree-specific storage decisions too early.
 
+## As built (2026-09)
+
+The sections above are the original framing and still describe the shape. What exists now, layer
+by layer, with the doc that owns each:
+
+| Layer | What it does | Doc |
+|---|---|---|
+| Ingest | WebSocket sessions, one batch in flight, formats negotiated per batch (`xyz_rgb_i_v1`, `xyzi_q4_v2`) | [`protocol-v1.md`](./protocol-v1.md) |
+| Durability | Per-session append-only batch log, one fsync per batch, CRC-framed, replayed on restart; SQLite in WAL mode for metadata | [`batch-log.md`](./batch-log.md) |
+| Fusion | Fixed 2 m world chunks of 4 cm voxel accumulators (sums + hits + opportunity baseline), chunk files as an incrementally checkpointed cache, per-batch index for partial re-fusion | [`phase-2-voxel-fusion-lod.md`](./phase-2-voxel-fusion-lod.md), [`batch-log.md`](./batch-log.md) |
+| Observation filter | Per-chunk field-of-view opportunity counters; serve-time `min_hits` / `min_ratio` filter, store never modified | [`observation-filter.md`](./observation-filter.md) |
+| Serving | View-driven mip-per-chunk LOD, keyframes + append-only deltas, `q8_chunk_v2` at 7 B per voxel, live overlay culled per point per viewer with opt-out and cap, permessage-deflate | [`phase-2-voxel-fusion-lod.md`](./phase-2-voxel-fusion-lod.md), [`protocol-v1.md`](./protocol-v1.md) |
+| Alignment | Python sidecar: keyframe pose graph, ICP-verified loop closures, incremental with a live watch mode; server applies corrections at fuse time and re-fuses only what moved | [`alignment.md`](./alignment.md) |
+| Viewer | Three.js page: per-chunk growable buffers, live ring overlay, filter and overlay controls | `public/viewer.js` |
+
+The decisions behind this layout are nodes in [`decisions/`](./decisions/).
+
 ## Stretch goals
 
 - Direct sensor adapters that publish into the ingest API without a separate client pipeline
-- Server-side pose estimation / SLAM integration for sensors that cannot provide stable odometry
-- On-the-fly registration refinement and loop-closure-aware remapping
+  (the KISS-ICP client is the closest thing: raw UDP in, poses + points out)
+- ~~Server-side pose estimation / SLAM integration~~ — started as the alignment sidecar
+  (loop closure over publisher odometry); scan-to-map refinement for publishers without their own
+  odometry is not built
+- ~~On-the-fly registration refinement and loop-closure-aware remapping~~ — the watch mode and
+  partial re-fusion do this; chunks still re-fuse wholesale after a closure (submaps are the next
+  rung, see `alignment.md`)
+- Range-image ingest for "video-like" streaming of spinning lidar (`protocol-v1.md`, deferred)
+- Potree-format snapshot export — not built; the Three.js viewer replaced the Potree plan
 
-## Open design questions
+## Design questions
 
-- What scanner(s) are the first ingestion targets?
-- Should sessions be append-only, or should we support explicit correction/rewrite operations?
-- Is the persistence target room-scale, building-scale, or larger?
-- ~~Do we need raw frame retention, or only fused world-state retention?~~ Resolved: raw batches
-  are retained in the per-session log, since fused state alone cannot support later pose
-  correction. Retention/compaction policy is still open.
-- Should the first live viewer be Potree-augmented, or a simpler Three.js-based prototype?
+Answered:
+
+- **First scanners:** Velodyne VLP-16 (bench bring-up done, KISS-ICP moving client written), VLP-32
+  first pass; everything else synthetic.
+- **Append-only or corrections?** Both: the log is append-only and never modified; corrections are
+  a separate layer applied at fuse time, so a session can always be rebuilt raw.
+- **Raw frame retention?** Yes, in the log, because voxel fusion is destructive and pose correction
+  needs the raw observations. Retention/compaction is still open.
+- **Viewer:** Three.js, not Potree.
+
+Open:
+
+- **Scale:** room-scale is tested; building-scale is untested (resident chunk budget, log growth at
+  ~19 GB/hour for a VLP-16, full re-fusion cost after a closure).
+- **Log retention** once a session is closed and checkpointed.
+- **Dynamic scenes** (people walking through): no temporal decay anywhere.
+- **Multi-session / cross-session alignment:** needs a per-session world transform and a global
+  registration front end.

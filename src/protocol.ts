@@ -103,6 +103,12 @@ export interface ViewerViewMessage {
     min_hits?: number;
     min_ratio?: number;
   };
+  // Live overlay control. `overlay: false` stops chunk_update entirely for this
+  // viewer; otherwise each batch is culled to the points inside this view and, when
+  // `overlay_max_points` is set, decimated to at most that many. Default: on,
+  // unlimited.
+  overlay?: boolean;
+  overlay_max_points?: number;
 }
 
 export type ClientControlMessage =
