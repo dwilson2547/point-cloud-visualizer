@@ -98,33 +98,44 @@ def read_log(path: str, *, on_warning=None) -> Iterator[Batch]:
 
 
 def parse_log(data: bytes, *, on_warning=None) -> Iterator[Batch]:
+    batches, consumed = parse_records(data)
+    if consumed < len(data):
+        _warn(on_warning, f"torn or corrupt record at {consumed}; ignoring {len(data) - consumed} bytes")
+    yield from batches
+
+
+def parse_records(data: bytes) -> tuple[list[Batch], int]:
+    """Parse every complete record at the front of `data`. Returns the batches and the
+    number of bytes consumed; a caller tailing a growing log keeps the remainder and
+    prepends it to the next read."""
+    batches: list[Batch] = []
     offset = 0
     size = len(data)
-    while offset < size:
-        if size - offset < FRAME.size:
-            _warn(on_warning, f"torn frame at {offset}; ignoring {size - offset} bytes")
-            return
+    while size - offset >= FRAME.size:
         magic, header_len, payload_len, crc = FRAME.unpack_from(data, offset)
         body_start = offset + FRAME.size
         body_end = body_start + header_len + payload_len
-        if magic != LOG_MAGIC or header_len == 0 or body_end > size:
-            _warn(on_warning, f"corrupt or torn record at {offset}; ignoring the rest")
-            return
+        if magic != LOG_MAGIC or header_len == 0:
+            break  # corrupt: nothing after it is trusted
+        if body_end > size:
+            break  # incomplete: wait for the rest
         body = data[body_start:body_end]
         if zlib.crc32(body) & 0xFFFFFFFF != crc:
-            _warn(on_warning, f"crc mismatch at {offset}; ignoring the rest")
-            return
+            break
         header = json.loads(body[:header_len])
         raw = np.frombuffer(body[header_len:], dtype=POINT_DTYPE)
         points = np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float64)
-        yield Batch(
-            sequence=int(header["sequence"]),
-            pose_sequence=int(header["pose_sequence"]),
-            timestamp=str(header.get("timestamp", "")),
-            pose=pose_to_matrix(header["pose"]["translation_m"], header["pose"]["rotation_xyzw"]),
-            points=points,
+        batches.append(
+            Batch(
+                sequence=int(header["sequence"]),
+                pose_sequence=int(header["pose_sequence"]),
+                timestamp=str(header.get("timestamp", "")),
+                pose=pose_to_matrix(header["pose"]["translation_m"], header["pose"]["rotation_xyzw"]),
+                points=points,
+            )
         )
         offset = body_end
+    return batches, offset
 
 
 def _warn(on_warning, message: str) -> None:

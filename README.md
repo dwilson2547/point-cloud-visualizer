@@ -107,6 +107,8 @@ The chunk store is configurable by environment variables:
 - `LIVE_REFRESH_MS` — coalescing interval for refreshing changed LOD chunks (default: `500`)
 - `CHECKPOINT_TICK_MS` — how often the incremental checkpoint runs (default: `1000`)
 - `CHECKPOINT_CHUNKS_PER_TICK` — chunk files one checkpoint tick may rewrite (default: `8`)
+- `REFUSE_TOLERANCE_M` — a pose correction smaller than this does not re-fuse its batch (default:
+  half the fusion voxel)
 
 `point_batch_ack` is sent only after the batch has been appended and fsynced to the session's
 batch log and fused into the resident chunk cache. Publishers should keep at most one point batch
@@ -148,7 +150,8 @@ the server re-fuses the session from its log and viewers snap to the corrected c
 ```bash
 alignment/setup.sh
 alignment/.venv/bin/pcv-align-demo --session-id demo-loop    # synthetic drifted loop
-alignment/run.sh --session-id demo-loop --loop-min-gap 15      # align + install
+alignment/run.sh --session-id demo-loop --loop-min-gap 15      # align + install (one shot)
+alignment/run.sh --session-id demo-loop --watch                # or tail a live session and install on each closure
 ```
 
 See [`docs/alignment.md`](docs/alignment.md) for the pipeline, tuning knobs and measured results.

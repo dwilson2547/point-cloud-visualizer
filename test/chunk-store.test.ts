@@ -792,3 +792,116 @@ test('pose corrections are applied on rebuild, on live fusion, and after a resta
   assert.equal(chunkStore.getPoseCorrections('corr'), null);
   chunkStore.close();
 });
+
+test('a correction re-fuses only the batches and chunks it moves, matching a full rebuild', () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-partial-'));
+  const sessionStore = new SessionStore();
+  let chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  const session = sessionStore.createSession({
+    type: 'create_session',
+    protocol_version: 1,
+    session_id: 'partial',
+    publisher_id: 'partial-pub',
+    started_at: '2026-07-10T00:00:00Z',
+    frame_id: 'map',
+    units: 'meters',
+  });
+  chunkStore.syncSession(session);
+  // Each batch is one local point (0.5, 0.5, 0.5) placed by its pose translation.
+  const storeBatch = (poseSequence: number, batchSequence: number, tx: number): void => {
+    sessionStore.applyPoseUpdate({
+      type: 'pose_update',
+      session_id: 'partial',
+      publisher_id: 'partial-pub',
+      sequence: poseSequence,
+      timestamp: `2026-07-10T00:00:0${poseSequence}Z`,
+      pose: { translation_m: [tx, 0, 0], rotation_xyzw: [0, 0, 0, 1] },
+    });
+    const payload = Buffer.alloc(POINT_STRIDE_BYTES);
+    payload.writeFloatLE(0.5, 0);
+    payload.writeFloatLE(0.5, 4);
+    payload.writeFloatLE(0.5, 8);
+    const accepted = sessionStore.preparePointBatch(
+      {
+        type: 'point_batch_header',
+        session_id: 'partial',
+        publisher_id: 'partial-pub',
+        sequence: batchSequence,
+        timestamp: `2026-07-10T00:00:0${batchSequence}Z`,
+        pose_sequence: poseSequence,
+        point_count: 1,
+        point_format: POINT_FORMAT,
+        encoding: 'binary_le',
+        compression: 'none',
+        stride_bytes: POINT_STRIDE_BYTES,
+      },
+      payload,
+    );
+    chunkStore.storeAcceptedBatchDurably(accepted, { ...sessionStore.listSessions()[0], lastSequence: batchSequence });
+    sessionStore.commitPointBatch(accepted);
+  };
+  const cellsOf = (): string => chunkStore.listSessionChunkKeys('partial').map((c) => c.chunkKey).sort().join(' ');
+  const worldOf = (): string =>
+    chunkStore
+      .readSessionWorldChunks('partial')
+      .map((b) => b.toString('hex'))
+      .sort()
+      .join(',');
+  const pose = (tx: number, ty = 0) => ({ translation_m: [tx, ty, 0] as [number, number, number], rotation_xyzw: [0, 0, 0, 1] as [number, number, number, number] });
+
+  storeBatch(1, 2, 0); // chunk 0
+  storeBatch(3, 4, 2); // chunk 2
+  storeBatch(5, 6, 4); // chunk 4
+  storeBatch(7, 8, 2); // chunk 2 again, shares it with batch 4
+  assert.equal(cellsOf(), '0_0_0 2_0_0 4_0_0');
+
+  // Move only pose 3 (batch 4) from chunk 2 to chunk 6. Chunk 2 must be rebuilt from
+  // batch 8 alone; chunk 6 created; chunks 0 and 4 untouched.
+  let result = chunkStore.setPoseCorrections('partial', {
+    session_id: 'partial',
+    generated_at: 'x',
+    poses: [{ pose_sequence: 3, pose: pose(6) }],
+  });
+  assert.equal(result.mode, 'partial');
+  assert.equal(result.chunks, 2, 'old chunk 2 + new chunk 6');
+  assert.equal(result.batches, 2, 'batches 4 and 8 span the affected chunks');
+  assert.equal(cellsOf(), '0_0_0 2_0_0 4_0_0 6_0_0');
+  const chunk2 = chunkStore.deriveChunkLevel('partial', '2_0_0', 99);
+  assert.equal(chunk2.byteLength, POINT_STRIDE_BYTES, 'chunk 2 holds only batch 8 now');
+  assert.ok(Math.abs(chunk2.readFloatLE(0) - 2.5) < 1e-6);
+  const partialWorld = worldOf();
+  assert.deepEqual(chunkStore.rebuildSession('partial').mode, 'full');
+  assert.equal(worldOf(), partialWorld, 'partial rebuild equals a full rebuild');
+
+  // Below the re-fuse tolerance (default half a voxel): nothing happens.
+  result = chunkStore.setPoseCorrections('partial', {
+    session_id: 'partial',
+    generated_at: 'x',
+    poses: [{ pose_sequence: 3, pose: pose(6) }, { pose_sequence: 5, pose: pose(4.005) }],
+  });
+  assert.equal(result.mode, 'unchanged');
+
+  // A tail moves every batch past the last corrected sequence (batches 6 and 8) by +1 y.
+  result = chunkStore.setPoseCorrections('partial', {
+    session_id: 'partial',
+    generated_at: 'x',
+    poses: [{ pose_sequence: 3, pose: pose(6) }],
+    tail: pose(0, 1),
+  });
+  assert.equal(result.mode, 'partial');
+  assert.equal(result.batches, 2);
+  assert.equal(result.chunks, 4, 'two old cells vacated, two new cells filled');
+  assert.equal(cellsOf(), '0_0_0 2_1_0 4_1_0 6_0_0');
+  const tailWorld = worldOf();
+  chunkStore.rebuildSession('partial');
+  assert.equal(worldOf(), tailWorld);
+
+  // Moving most batches falls back to a full rebuild; the index survives a restart.
+  chunkStore.close();
+  chunkStore = new ChunkStore({ rootDir, chunkSizeMeters: 1, fuseVoxelMeters: 0.04, log: () => {} });
+  assert.equal(cellsOf(), '0_0_0 2_1_0 4_1_0 6_0_0');
+  result = chunkStore.setPoseCorrections('partial', null);
+  assert.equal(result.mode, 'full');
+  assert.equal(cellsOf(), '0_0_0 2_0_0 4_0_0');
+  chunkStore.close();
+});

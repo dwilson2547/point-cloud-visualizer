@@ -90,6 +90,34 @@ export class BatchLogWriter {
   }
 }
 
+// Read the single record that starts at `offset`. Used by partial rebuilds, which know
+// each batch's offset from the store's batch index. Throws on a corrupt frame.
+export function readLogRecordAt(filePath: string, offset: number): LogRecord {
+  const descriptor = fs.openSync(filePath, 'r');
+  try {
+    const frame = Buffer.allocUnsafe(FRAME_BYTES);
+    if (fs.readSync(descriptor, frame, 0, FRAME_BYTES, offset) !== FRAME_BYTES) {
+      throw new Error(`Batch log ${filePath}: no record at offset ${offset}`);
+    }
+    const headerLength = frame.readUInt32LE(4);
+    const payloadLength = frame.readUInt32LE(8);
+    if (frame.readUInt32LE(0) !== LOG_MAGIC || headerLength === 0 || headerLength > MAX_HEADER_BYTES) {
+      throw new Error(`Batch log ${filePath}: corrupt frame at offset ${offset}`);
+    }
+    const body = Buffer.allocUnsafe(headerLength + payloadLength);
+    if (fs.readSync(descriptor, body, 0, body.byteLength, offset + FRAME_BYTES) !== body.byteLength) {
+      throw new Error(`Batch log ${filePath}: torn record at offset ${offset}`);
+    }
+    if (zlib.crc32(body) !== frame.readUInt32LE(12)) {
+      throw new Error(`Batch log ${filePath}: crc mismatch at offset ${offset}`);
+    }
+    const header = JSON.parse(body.subarray(0, headerLength).toString('utf8')) as LogRecordHeader;
+    return { header, payload: body.subarray(headerLength), offset, nextOffset: offset + FRAME_BYTES + body.byteLength };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 // Walk records from `fromOffset`, calling `visit` for each intact one. Stops at the
 // first torn or corrupt record and truncates the file there, so a crash mid-append
 // leaves a log whose every record is complete. Returns where the log now ends.

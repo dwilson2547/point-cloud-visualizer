@@ -47,7 +47,14 @@ test('installing pose corrections rebuilds the session from its log and resets v
 
   const logResponse = await fetch(`${base}/sessions/corr-session/log`);
   assert.equal(logResponse.ok, true);
-  assert.ok((await logResponse.arrayBuffer()).byteLength > POINT_STRIDE_BYTES);
+  const logBytes = (await logResponse.arrayBuffer()).byteLength;
+  assert.ok(logBytes > POINT_STRIDE_BYTES);
+  // The sidecar tails the log with Range requests.
+  const partial = await fetch(`${base}/sessions/corr-session/log`, { headers: { range: 'bytes=16-' } });
+  assert.equal(partial.status, 206);
+  assert.equal((await partial.arrayBuffer()).byteLength, logBytes - 16);
+  const nothingNew = await fetch(`${base}/sessions/corr-session/log`, { headers: { range: `bytes=${logBytes}-` } });
+  assert.equal(nothingNew.status, 416);
 
   assert.equal((await fetch(`${base}/sessions/corr-session/pose-corrections`)).status, 404);
 
@@ -63,9 +70,9 @@ test('installing pose corrections rebuilds the session from its log and resets v
   });
   const putText = await put.text();
   assert.equal(put.status, 200, putText);
-  const putBody = JSON.parse(putText) as { batches: number; chunks: number };
+  const putBody = JSON.parse(putText) as { batches: number; chunks: number; mode: string };
   assert.equal(putBody.batches, 1);
-  assert.equal(putBody.chunks, 1);
+  assert.equal(putBody.mode, 'full', 'one batch moved out of one: past the partial threshold');
 
   const rebuilt = await viewerMessages.nextJson();
   assert.equal(rebuilt.type, 'session_rebuilt');

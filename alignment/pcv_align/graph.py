@@ -293,24 +293,15 @@ def propagate(
 
 
 def align(batches: Sequence[Batch], cfg: AlignConfig, log: Logger = lambda _: None) -> AlignResult:
+    """One-shot alignment of a whole log: the incremental aligner fed everything at once."""
+    from .incremental import IncrementalAligner  # local import: incremental depends on this module
+
     started = time.perf_counter()
-    keyframes = select_keyframes(batches, cfg)
-    log(f"{len(batches)} batches -> {len(keyframes)} keyframes")
-    candidates = find_loop_candidates(keyframes, cfg)
-    log(f"{len(candidates)} loop candidates")
-    loops = verify_loops(keyframes, candidates, cfg, log)
-    if loops:
-        corrected = optimize(keyframes, loops, cfg, log)
-    else:
+    aligner = IncrementalAligner(cfg, log)
+    aligner.extend(batches)
+    log(f"{len(batches)} batches -> {len(aligner.keyframes)} keyframes, {aligner.candidates} candidates")
+    if not aligner.loops:
         log("no loops accepted; poses unchanged")
-        corrected = [kf.pose.copy() for kf in keyframes]
-    poses, tail = propagate(batches, keyframes, corrected)
-    drift = [
-        float(np.linalg.norm((corrected[k] @ np.linalg.inv(keyframes[k].pose))[:3, 3]))
-        for k in range(len(keyframes))
-    ]
-    stats = {
-        "max_keyframe_correction_m": max(drift) if drift else 0.0,
-        "seconds": round(time.perf_counter() - started, 2),
-    }
-    return AlignResult(corrected, poses, tail, keyframes, loops, len(candidates), stats)
+    result = aligner.result()
+    result.stats["seconds"] = round(time.perf_counter() - started, 2)
+    return result

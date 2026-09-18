@@ -35,12 +35,22 @@ publisher ──pose+batch──▶ server ──▶ log/<session>.log   (raw po
   last corrected sequence, else the logged pose. This applies to live ingest, log replay and
   rebuilds alike, so a correction survives restarts and a still-connected publisher keeps landing
   in the corrected frame.
-- **Rebuild** (`ChunkStore.rebuildSession`): drop the session's resident chunks without persisting,
-  delete its chunk files and rows, reset the checkpoint, replay the whole log under the effective
-  poses, checkpoint. Synchronous on the event loop, so ingest for that session waits; a long
-  session blocks for roughly its fusion cost (about 20 ms per VLP-16 spin).
-- **HTTP**: `GET /sessions/:id/log`, `GET|PUT|DELETE /sessions/:id/pose-corrections`,
-  `POST /sessions/:id/rebuild`. After any rebuild every viewer of the session receives
+- **Rebuild** (`ChunkStore.rebuildChanged`): the store keeps a per-batch index (`batches`,
+  `batch_chunks` in SQLite: log offset, the pose each batch was fused with, the chunks its points
+  span). Installing corrections compares every batch's fused pose with its new effective pose;
+  batches that moved by less than `REFUSE_TOLERANCE_M` (default half the fusion voxel, 2 cm, or the
+  equivalent rotation at 25 m) are left alone. If nothing moved the call is a no-op; if more than
+  half moved the session is rebuilt wholesale (`rebuildSession`: drop everything, replay the log);
+  otherwise a **partial rebuild** drops only the chunks the moved batches used to span plus the
+  ones they now span, and re-fuses every batch spanning those chunks, restricted to them, using
+  random-access reads at the indexed log offsets. The partial result is byte-identical to a full
+  rebuild (asserted in the chunk-store tests). Either way the checkpoint is reset first so a crash
+  mid-rebuild replays the log on restart. Rebuilds are synchronous on the event loop, so ingest for
+  that session waits for roughly the fusion cost of the batches being re-fused.
+- **HTTP**: `GET /sessions/:id/log` (supports `Range: bytes=N-` so a tailing sidecar fetches only
+  what was appended; 416 when nothing is new), `GET|PUT|DELETE /sessions/:id/pose-corrections`,
+  `POST /sessions/:id/rebuild`. Responses carry `mode: full | partial | unchanged`. After any
+  rebuild every viewer of the session receives
   `session_rebuilt`, clears both layers, and the refresh tick re-sends the base layer for its
   camera. Live `chunk_update` overlays carry the effective pose, not the publisher's.
 
@@ -63,6 +73,26 @@ publisher ──pose+batch──▶ server ──▶ log/<session>.log   (raw po
    `uncertain=True` so the line process can down-weight a bad closure.
 6. **Propagation** (`propagate`): every batch keeps its odometry offset from the keyframe at or
    before it. The tail is the world-frame correction of the last keyframe.
+
+### Incremental mode
+
+`IncrementalAligner` (`pcv_align/incremental.py`) holds the graph between feeds. `extend(batches)`
+adds keyframes and odometry edges as they arrive, searches loop candidates for each new keyframe
+against the **optimised** positions (so a later revisit is found even after earlier closures moved
+the trajectory), verifies with ICP seeded from the optimised relative pose, and re-optimises only
+when a loop was newly accepted, warm-started from the previous solution. The one-shot `align()` is
+this class fed the whole log at once; the two agree to within 5 cm at the end of the synthetic
+loop (`test_incremental_feed_matches_one_shot_alignment`).
+
+`pcv-align --watch` runs it against a live session: every `--interval` seconds it fetches the log
+tail with a Range request, keeps any half-received record for the next read, feeds complete
+batches to the aligner, and installs corrections whenever a closure was accepted. It waits for the
+session to appear, and exits once the session is closed and the tail is drained. Live run on the
+synthetic loop streamed at 10 Hz: first closure at 37 keyframes (7 loops, installed as a full
+rebuild of 75 batches), refinement at 41 keyframes (15 loops, 81 batches), final cloud identical
+to the one-shot result. Both installs were full rebuilds because a closure moves most of the
+trajectory past the 2 cm tolerance; partial rebuilds kick in for small refinements and for tail
+changes.
 
 Frame convention, because it is the easiest thing to get backwards: a node pose is
 `world_T_node`; an Open3D edge from `source` to `target` carries
@@ -95,6 +125,7 @@ npm run dev                                          # server
 alignment/.venv/bin/pcv-align-demo --session-id demo-loop   # publish the drifted loop
 # open http://localhost:8080/?session_id=demo-loop — the walls double up where the loop closes
 alignment/run.sh --session-id demo-loop --loop-min-gap 15   # align and install; the viewer snaps
+alignment/run.sh --session-id demo-loop --watch --loop-min-gap 15   # or: start this first, then the demo
 curl -X DELETE localhost:8080/sessions/demo-loop/pose-corrections   # back to raw odometry
 ```
 
@@ -103,9 +134,11 @@ curl -X DELETE localhost:8080/sessions/demo-loop/pose-corrections   # back to ra
 
 ## Limits and next steps
 
-- **Batch, not incremental.** Every run rebuilds the whole graph and re-fuses the whole session.
-  Incremental (run on a timer over the log tail, add new keyframes and loops, re-fuse only chunks
-  whose keyframes moved) is the natural next rung; the rebuild is the expensive part.
+- **A closure still re-fuses most of the session.** The graph is incremental and the server
+  re-fuses only what moved, but a loop closure moves nearly everything since the last closure. The
+  remaining lever is to make the fused chunks follow keyframes (submaps rigidly attached to a
+  keyframe, re-fused only when *their* keyframe moves beyond tolerance), which the batch index
+  already makes possible.
 - **Loop search is odometry-proximity only.** Large drift or a long loop can put the true revisit
   outside `loop_radius_m`. Place recognition (scan context or a global descriptor) would find those.
 - **No IMU or gravity prior.** Nothing constrains roll/pitch beyond ICP; fine for a level VLP-16.

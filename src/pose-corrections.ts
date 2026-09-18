@@ -91,6 +91,26 @@ export function rotateVector(
   ];
 }
 
+// Whether two poses differ enough to change where a batch's points fuse: translation
+// beyond `toleranceM`, or a rotation that would move a point at `rangeM` by more than
+// that. Used to skip re-fusing batches whose correction is below voxel resolution.
+export function posesDiffer(a: Pose, b: Pose, toleranceM: number, rangeM: number = 25): boolean {
+  const dx = a.translation_m[0] - b.translation_m[0];
+  const dy = a.translation_m[1] - b.translation_m[1];
+  const dz = a.translation_m[2] - b.translation_m[2];
+  if (Math.hypot(dx, dy, dz) > toleranceM) {
+    return true;
+  }
+  const dot = Math.abs(
+    a.rotation_xyzw[0] * b.rotation_xyzw[0] +
+      a.rotation_xyzw[1] * b.rotation_xyzw[1] +
+      a.rotation_xyzw[2] * b.rotation_xyzw[2] +
+      a.rotation_xyzw[3] * b.rotation_xyzw[3],
+  );
+  const angle = 2 * Math.acos(Math.min(1, dot));
+  return angle * rangeM > toleranceM;
+}
+
 export function validatePoseCorrections(input: unknown, sessionId: string): PoseCorrections {
   if (typeof input !== 'object' || input === null) {
     throw new Error('Pose corrections must be a JSON object');

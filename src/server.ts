@@ -71,6 +71,7 @@ const chunkStore = new ChunkStore({
   flushPointThreshold: parseIntegerEnv(process.env.FLUSH_POINT_THRESHOLD, 50_000),
   maxDirtyChunks: parseIntegerEnv(process.env.MAX_DIRTY_CHUNKS, 128),
   maxChunksPerBatch: parseIntegerEnv(process.env.MAX_CHUNKS_PER_BATCH, 128),
+  refuseToleranceM: process.env.REFUSE_TOLERANCE_M ? parseFloatEnv(process.env.REFUSE_TOLERANCE_M, 0.02) : undefined,
 });
 const sessionStore = new SessionStore({ maxPointsPerBatch, maxRetainedPoses });
 sessionStore.restoreSessions(chunkStore.loadSessions());
@@ -205,8 +206,26 @@ async function handleSessionResource(
         res.writeHead(404).end('No batch log for this session');
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': stat.size });
-      fs.createReadStream(logPath).pipe(res);
+      // `Range: bytes=N-` lets the alignment sidecar fetch only what was appended
+      // since its last pass. The end is pinned at the size seen here, so a record
+      // appended mid-stream is not half-read.
+      const range = req.headers.range?.match(/^bytes=(\d+)-$/);
+      const start = range ? Number(range[1]) : 0;
+      if (start > stat.size || (range && start === stat.size)) {
+        res.writeHead(416, { 'content-range': `bytes */${stat.size}` }).end();
+        return;
+      }
+      res.writeHead(range ? 206 : 200, {
+        'content-type': 'application/octet-stream',
+        'content-length': stat.size - start,
+        'accept-ranges': 'bytes',
+        ...(range ? { 'content-range': `bytes ${start}-${stat.size - 1}/${stat.size}` } : {}),
+      });
+      if (stat.size === start) {
+        res.end();
+        return;
+      }
+      fs.createReadStream(logPath, { start, end: stat.size - 1 }).pipe(res);
       return;
     }
     if (resource === 'pose-corrections' && req.method === 'GET') {

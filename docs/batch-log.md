@@ -144,3 +144,7 @@ closed, or keep only keyframes) is the obvious next lever if disk becomes the co
 - **Offline tooling.** A log is a complete, self-describing capture of a session that a Python
   sidecar can read directly (`kiss-icp`, Open3D, a pose-graph solver) without touching the server.
 - **Deterministic replay for tests and benchmarks** of the fusion and LOD paths.
+
+The store also keeps a small per-batch index in SQLite (`batches`: log offset, logged and fused
+pose; `batch_chunks`: chunks spanned) so a pose correction can re-fuse only the batches and chunks
+it moves, reading them back from the log by offset ([`alignment.md`](./alignment.md)).

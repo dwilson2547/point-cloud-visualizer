@@ -5,11 +5,13 @@ import argparse
 import json
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
 from .graph import AlignConfig, align
-from .log import read_log
+from .incremental import IncrementalAligner
+from .log import parse_records, read_log
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -21,6 +23,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-file", help="read this log instead of fetching it from the server")
     parser.add_argument("--out", help="also write the corrections JSON here")
     parser.add_argument("--dry-run", action="store_true", help="do not install the corrections")
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="keep tailing the log; re-optimise and re-install whenever a new loop closes; exit once the session is closed",
+    )
+    parser.add_argument("--interval", type=float, default=2.0, help="seconds between tail fetches in --watch")
     cfg = AlignConfig()
     parser.add_argument("--keyframe-distance", type=float, default=cfg.keyframe_distance_m)
     parser.add_argument("--keyframe-angle", type=float, default=cfg.keyframe_angle_deg)
@@ -78,9 +86,86 @@ def install(server_url: str, session_id: str, corrections: dict) -> dict:
         return json.loads(response.read())
 
 
+def fetch_tail(server_url: str, session_id: str, offset: int) -> bytes:
+    """Bytes appended to the session log since `offset` (empty when nothing new)."""
+    url = f"{server_url.rstrip('/')}/sessions/{session_id}/log"
+    request = urllib.request.Request(url, headers={"range": f"bytes={offset}-"})
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in (404, 416):  # no log yet, or nothing new
+            return b""
+        raise
+
+
+def session_closed(server_url: str, session_id: str) -> bool | None:
+    """True/False for a known session, None when the server does not know it (yet)."""
+    with urllib.request.urlopen(f"{server_url.rstrip('/')}/sessions") as response:
+        sessions = json.loads(response.read())
+    for session in sessions:
+        if session.get("sessionId") == session_id:
+            return bool(session.get("closed"))
+    return None
+
+
+def watch(args: argparse.Namespace, log) -> int:
+    """Tail the log; every new loop closure re-optimises the graph and re-installs
+    corrections, which the server applies as a partial rebuild of what moved."""
+    aligner = IncrementalAligner(config_from_args(args), log)
+    offset = 0
+    pending = b""
+    installs = 0
+    seen = False
+    while True:
+        closed = session_closed(args.server_url, args.session_id)
+        if closed is None:
+            if not seen:
+                log(f"waiting for session {args.session_id}")
+                seen = True  # log once
+                closed = False
+            else:
+                closed = False
+            time.sleep(args.interval)
+            continue
+        data = fetch_tail(args.server_url, args.session_id, offset)
+        offset += len(data)
+        batches, consumed = parse_records(pending + data)
+        pending = (pending + data)[consumed:]
+        new_loops = aligner.extend(batches) if batches else 0
+        if batches:
+            log(
+                f"+{len(batches)} batches -> {len(aligner.keyframes)} keyframes, "
+                f"{len(aligner.loops)} loops ({new_loops} new)"
+            )
+        if new_loops and not args.dry_run:
+            result = aligner.result()
+            corrections = result.to_corrections(args.session_id)
+            try:
+                response = install(args.server_url, args.session_id, corrections)
+                installs += 1
+                log(
+                    f"installed #{installs}: {response.get('mode')} rebuild, "
+                    f"{response.get('batches')} batches into {response.get('chunks')} chunks"
+                )
+            except urllib.error.HTTPError as error:
+                log(f"server rejected corrections: {error.read().decode('utf-8', 'replace')}")
+        if not data and closed:
+            log(f"session closed; {installs} installs, {len(aligner.loops)} loops")
+            if args.out:
+                with open(args.out, "w", encoding="utf-8") as handle:
+                    json.dump(aligner.result().to_corrections(args.session_id), handle)
+            return 0
+        time.sleep(args.interval)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     log = lambda message: print(message, file=sys.stderr)
+    if args.watch:
+        if args.log_file:
+            log("--watch tails the server; --log-file is ignored")
+        return watch(args, log)
     try:
         log_path = args.log_file or fetch_log(args.server_url, args.session_id)
     except urllib.error.HTTPError as error:
