@@ -17,7 +17,7 @@ import {
   toInternalPoints,
 } from '../src/point-formats.js';
 import { POINT_FORMAT, POINT_STRIDE_BYTES } from '../src/protocol.js';
-import { SocketMessages, connect, reservePort, startServer, stopServer } from './helpers.js';
+import { connect, messagesOf, reservePort, startServer, stopServer } from './helpers.js';
 
 function internal(points: Array<[number, number, number, number]>): Buffer {
   const buffer = Buffer.alloc(points.length * POINT_STRIDE_BYTES);
@@ -76,7 +76,7 @@ test('a q4 publisher and a q8 viewer interoperate end to end', async (t) => {
   });
 
   const ingest = await connect(`ws://127.0.0.1:${port}/ws/ingest`);
-  const ingestMessages = new SocketMessages(ingest);
+  const ingestMessages = messagesOf(ingest);
   ingest.send(
     JSON.stringify({
       type: 'create_session',
@@ -156,7 +156,7 @@ test('a q4 publisher and a q8 viewer interoperate end to end', async (t) => {
   );
 
   const viewer = await connect(`ws://127.0.0.1:${port}/ws/view?session_id=formats&lod=1&fmt=${SERVE_FORMAT_Q8}`);
-  const viewerMessages = new SocketMessages(viewer);
+  const viewerMessages = messagesOf(viewer);
   assert.equal((await viewerMessages.nextJson()).type, 'viewer_session_state');
   viewer.send(
     JSON.stringify({

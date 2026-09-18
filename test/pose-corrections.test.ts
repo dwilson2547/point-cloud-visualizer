@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { POINT_FORMAT, POINT_STRIDE_BYTES } from '../src/protocol.js';
-import { SocketMessages, connect, reservePort, startServer, stopServer } from './helpers.js';
+import { connect, messagesOf, reservePort, startServer, stopServer } from './helpers.js';
 
 test('installing pose corrections rebuilds the session from its log and resets viewers', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-corrections-'));
@@ -19,7 +19,7 @@ test('installing pose corrections rebuilds the session from its log and resets v
   const base = `http://127.0.0.1:${port}`;
 
   const ingest = await connect(`ws://127.0.0.1:${port}/ws/ingest`);
-  const ingestMessages = new SocketMessages(ingest);
+  const ingestMessages = messagesOf(ingest);
   ingest.send(
     JSON.stringify({
       type: 'create_session',
@@ -34,7 +34,7 @@ test('installing pose corrections rebuilds the session from its log and resets v
   assert.equal((await ingestMessages.nextJson()).type, 'session_ack');
 
   const viewer = await connect(`ws://127.0.0.1:${port}/ws/view?session_id=corr-session&lod=1`);
-  const viewerMessages = new SocketMessages(viewer);
+  const viewerMessages = messagesOf(viewer);
   assert.equal((await viewerMessages.nextJson()).type, 'viewer_session_state');
 
   // One point at local x=0.25 with an identity pose: world chunk 0.

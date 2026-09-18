@@ -25,7 +25,8 @@ small Three.js page; Potree is a reference in `../potree/`, not a dependency.
 ## Shape
 
 1. **Ingest** point batches, pose/odometry and session metadata over WebSocket
-   ([`docs/protocol-v1.md`](docs/protocol-v1.md)).
+   ([`docs/protocol-v1.md`](docs/protocol-v1.md)), or consume them from an Apache Iggy stream
+   ([`docs/pubsub.md`](docs/pubsub.md)).
 2. **Log** every batch as sent to a per-session append-only log; ack after one fsync
    ([`docs/batch-log.md`](docs/batch-log.md)).
 3. **Fuse** into per-chunk voxel accumulators with hit and opportunity counts; chunk files are a
@@ -48,6 +49,7 @@ current design are recorded in [`docs/decisions/`](docs/decisions/).
 - [`docs/batch-log.md`](docs/batch-log.md) — append-only batch log: durability, checkpoint, replay
 - [`docs/alignment.md`](docs/alignment.md) — pose graph + loop closure sidecar and the corrections layer
 - [`docs/observation-filter.md`](docs/observation-filter.md) — hits/opportunities counters and the serve-time artefact filter
+- [`docs/pubsub.md`](docs/pubsub.md) — the Apache Iggy consumer: batch-log records as messages, one topic per session
 - [`docs/phase-2-voxel-fusion-lod.md`](docs/phase-2-voxel-fusion-lod.md) — voxel fusion + LOD design
 - [`docs/vlp16-client.md`](docs/vlp16-client.md) — recommended Velodyne VLP-16 publisher setup
 - [`docs/vlp16-kiss-icp.md`](docs/vlp16-kiss-icp.md) — IMU-free moving VLP-16 trial with KISS-ICP
@@ -70,6 +72,7 @@ A TypeScript server (`src/`), a Three.js viewer (`public/`), Velodyne and synthe
 - `GET|PUT|DELETE /sessions/:sessionId/pose-corrections` and `POST /sessions/:sessionId/rebuild`
   for the alignment layer
 - `WS /ws/ingest` for publisher connections
+- an optional Apache Iggy consumer as a second inlet (`IGGY_HTTP_URL`; [`docs/pubsub.md`](docs/pubsub.md))
 - `WS /ws/view` for viewer connections
 - an append-only per-session batch log under `data/log/` — the durability anchor; one write and
   one fsync per accepted batch (see [`docs/batch-log.md`](docs/batch-log.md))
@@ -121,6 +124,8 @@ The chunk store is configurable by environment variables:
 - `MAX_VIEWER_BUFFERED_BYTES` — disconnect viewers that stop consuming before their outbound queue
   exceeds this limit (default: `33554432`)
 - `WS_DEFLATE` — set to `0` to disable permessage-deflate on both WebSocket endpoints
+- `IGGY_HTTP_URL`, `IGGY_USERNAME`, `IGGY_PASSWORD`, `IGGY_STREAM`, `IGGY_CONSUMER`, `IGGY_POLL_MS`,
+  `IGGY_PAGE_SIZE` — the pub/sub consumer; unset `IGGY_HTTP_URL` disables it
 - `LIVE_REFRESH_MS` — coalescing interval for refreshing changed LOD chunks (default: `250`);
   refreshes send only the voxels added since the viewer's version (`chunk_delta`), with periodic
   keyframes

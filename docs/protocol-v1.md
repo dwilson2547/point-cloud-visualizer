@@ -19,6 +19,10 @@ or a proxy layer in the first pass.
 
 ## Transport
 
+A second inlet consumes the same batches from an Apache Iggy stream, where each message is a
+batch-log record and control messages are JSON ([`pubsub.md`](./pubsub.md)). The rest of this
+document is the WebSocket protocol.
+
 - **Protocol:** WebSocket
 - **Direction:** bidirectional
 - **Encoding:** JSON control messages plus binary point-batch frames

@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { POINT_FORMAT, POINT_STRIDE_BYTES } from '../src/protocol.js';
-import { SocketMessages, connect, reservePort, startServer, stopServer } from './helpers.js';
+import { connect, messagesOf, reservePort, startServer, stopServer } from './helpers.js';
 
 test('a viewer receives a keyframe, then only the added voxels as deltas', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-deltas-'));
@@ -18,7 +18,7 @@ test('a viewer receives a keyframe, then only the added voxels as deltas', async
   });
 
   const ingest = await connect(`ws://127.0.0.1:${port}/ws/ingest`);
-  const ingestMessages = new SocketMessages(ingest);
+  const ingestMessages = messagesOf(ingest, 'ingest');
   ingest.send(
     JSON.stringify({
       type: 'create_session',
@@ -75,7 +75,7 @@ test('a viewer receives a keyframe, then only the added voxels as deltas', async
   await publish([[0.1, 0.5, 0.5], [0.2, 0.5, 0.5]]);
 
   const viewer = await connect(`ws://127.0.0.1:${port}/ws/view?session_id=deltas&lod=1`);
-  const viewerMessages = new SocketMessages(viewer);
+  const viewerMessages = messagesOf(viewer, 'viewer');
   assert.equal((await viewerMessages.nextJson()).type, 'viewer_session_state');
   viewer.send(
     JSON.stringify({

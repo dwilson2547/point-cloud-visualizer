@@ -9,6 +9,7 @@ import {
   type ViewerSessionStateMessage,
 } from './protocol.js';
 import { INGEST_FORMATS } from './point-formats.js';
+import type { LogRecordHeader } from './batch-log.js';
 
 export interface SessionRecord {
   sessionId: string;
@@ -214,6 +215,100 @@ export class SessionStore {
     session.totalPoints += header.point_count;
     session.lastSequence = header.sequence;
     session.lastSeenAt = header.timestamp;
+    return session;
+  }
+
+  // A batch that arrived as a self-contained log record (pub/sub consumer) rather
+  // than over a publisher socket: the pose travels with it, so no pose_update precedes
+  // it, and delivery is at-least-once, so a sequence at or below the session's last is
+  // a redelivery and returns null. Sequences need only increase, not step by one.
+  prepareExternalBatch(sessionId: string, record: LogRecordHeader, payload: Buffer): AcceptedBatch | null {
+    const session = this.requireSession(sessionId);
+    if (!Number.isInteger(record.sequence) || record.sequence <= 0) {
+      throw new Error(`Invalid sequence ${record.sequence}`);
+    }
+    if (record.sequence <= session.lastSequence) {
+      return null;
+    }
+    const format = record.point_format ?? POINT_FORMAT;
+    const stride = INGEST_FORMATS[format];
+    if (stride === undefined) {
+      throw new Error(`Unsupported point format ${format}`);
+    }
+    if (
+      !Number.isInteger(record.point_count) ||
+      record.point_count < 0 ||
+      record.point_count > this.maxPointsPerBatch ||
+      payload.byteLength !== record.point_count * stride
+    ) {
+      throw new Error(`Invalid point_count ${record.point_count} for a ${payload.byteLength}-byte payload`);
+    }
+    if (!Number.isInteger(record.pose_sequence) || record.pose_sequence <= 0) {
+      throw new Error(`Invalid pose_sequence ${record.pose_sequence}`);
+    }
+    validateTimestamp(record.timestamp, 'timestamp');
+    const pose: PoseUpdateMessage = {
+      type: 'pose_update',
+      session_id: sessionId,
+      publisher_id: session.publisherId,
+      sequence: record.pose_sequence,
+      timestamp: record.timestamp,
+      pose: { translation_m: [...record.pose.translation_m], rotation_xyzw: [...record.pose.rotation_xyzw] },
+    };
+    validatePose(pose);
+    if (format === POINT_FORMAT) {
+      validatePointPayload(payload);
+    }
+    const header: PointBatchHeaderMessage = {
+      type: 'point_batch_header',
+      session_id: sessionId,
+      publisher_id: session.publisherId,
+      sequence: record.sequence,
+      timestamp: record.timestamp,
+      pose_sequence: record.pose_sequence,
+      point_count: record.point_count,
+      point_format: format,
+      encoding: 'binary_le',
+      compression: 'none',
+      stride_bytes: stride,
+    };
+    return { session, header, payload, pose };
+  }
+
+  commitExternalBatch(accepted: AcceptedBatch): SessionRecord {
+    const { session, header } = accepted;
+    if (header.sequence <= session.lastSequence) {
+      throw new Error(`Sequence ${header.sequence} already committed`);
+    }
+    session.closed = false;
+    session.pointBatches += 1;
+    session.totalPoints += header.point_count;
+    session.lastSequence = header.sequence;
+    session.lastPoseSequence = header.pose_sequence;
+    session.lastSeenAt = header.timestamp;
+    return session;
+  }
+
+  // Create-or-resume for a consumer: a session announced twice (a publisher restarted,
+  // or the topic replayed) is reopened rather than rejected.
+  ensureSession(message: CreateSessionMessage): SessionRecord {
+    const existing = this.sessions.get(message.session_id);
+    if (!existing) {
+      return this.createSession(message);
+    }
+    if (existing.publisherId !== message.publisher_id) {
+      throw new Error(`Publisher mismatch for session ${message.session_id}`);
+    }
+    existing.closed = false;
+    existing.lastSeenAt = new Date().toISOString();
+    return existing;
+  }
+
+  // Close without a sequence check (pub/sub close_session carries none that we trust).
+  markClosed(sessionId: string): SessionRecord {
+    const session = this.requireSession(sessionId);
+    session.closed = true;
+    session.lastSeenAt = new Date().toISOString();
     return session;
   }
 

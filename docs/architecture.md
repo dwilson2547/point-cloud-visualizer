@@ -119,7 +119,7 @@ by layer, with the doc that owns each:
 
 | Layer | What it does | Doc |
 |---|---|---|
-| Ingest | WebSocket sessions, one batch in flight, formats negotiated per batch (`xyz_rgb_i_v1`, `xyzi_q4_v2`) | [`protocol-v1.md`](./protocol-v1.md) |
+| Ingest | WebSocket sessions, one batch in flight, formats negotiated per batch (`xyz_rgb_i_v1`, `xyzi_q4_v2`); or an Apache Iggy consumer, one topic per session, messages = log records | [`protocol-v1.md`](./protocol-v1.md), [`pubsub.md`](./pubsub.md) |
 | Durability | Per-session append-only batch log, one fsync per batch, CRC-framed, replayed on restart; SQLite in WAL mode for metadata | [`batch-log.md`](./batch-log.md) |
 | Fusion | Fixed 2 m world chunks of 4 cm voxel accumulators (sums + hits + opportunity baseline), chunk files as an incrementally checkpointed cache, per-batch index for partial re-fusion | [`phase-2-voxel-fusion-lod.md`](./phase-2-voxel-fusion-lod.md), [`batch-log.md`](./batch-log.md) |
 | Observation filter | Per-chunk field-of-view opportunity counters; serve-time `min_hits` / `min_ratio` filter, store never modified | [`observation-filter.md`](./observation-filter.md) |

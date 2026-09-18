@@ -27,6 +27,10 @@ import {
 } from './protocol.js';
 import { ChunkStore, DurableBatchError, type ObservationFilter, type RebuildResult } from './chunk-store.js';
 import { validatePoseCorrections } from './pose-corrections.js';
+import { IggyHttpClient } from './iggy-http.js';
+import { IggyConsumer } from './iggy-consumer.js';
+import type { LogRecord } from './batch-log.js';
+import type { CreateSessionMessage } from './protocol.js';
 import {
   INGEST_FORMATS,
   SERVE_FORMATS,
@@ -37,7 +41,7 @@ import {
   selectRows,
   worldPositions,
 } from './point-formats.js';
-import { SessionStore } from './session-store.js';
+import { SessionStore, type AcceptedBatch } from './session-store.js';
 import {
   buildFrustum,
   frustumContainsPoint,
@@ -528,7 +532,7 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
   };
   const { touchedKeys, pose } = chunkStore.storeAcceptedBatchDurably(accepted, nextSession);
   sessionStore.commitPointBatch(accepted);
-  markChunksDirty(accepted.session.sessionId, touchedKeys);
+  fanOutAccepted(accepted, touchedKeys, pose);
 
   send(ws, {
     type: 'point_batch_ack',
@@ -537,10 +541,113 @@ function handlePointBatchBinary(ws: WebSocket, state: ConnectionState, data: Raw
     accepted_points: accepted.header.point_count,
     rejected_points: 0,
   });
+}
 
-  // Viewers place the live overlay with the pose the batch was actually fused with,
-  // which differs from the publisher's when pose corrections are installed.
+// After a batch is durable: mark its chunks for the LOD refresh and broadcast the live
+// overlay. Viewers place the overlay with the pose the batch was actually fused with,
+// which differs from the publisher's when pose corrections are installed.
+function fanOutAccepted(accepted: AcceptedBatch, touchedKeys: string[], pose: Pose): void {
+  markChunksDirty(accepted.session.sessionId, touchedKeys);
   broadcastChunkUpdate(accepted.header, accepted.payload, pose);
+}
+
+// ---------------------------------------------------------------- pub/sub inlet
+// Batches arriving from the Iggy consumer take the same durable path as socket
+// batches, minus the ack (the consumer commits its offset instead) and minus the
+// one-publisher-per-session socket rule. See docs/pubsub.md.
+function ingestExternalBatch(sessionId: string, record: LogRecord): void {
+  const accepted = sessionStore.prepareExternalBatch(sessionId, record.header, record.payload);
+  if (!accepted) {
+    return; // redelivered or out of order: already committed
+  }
+  const nextSession = {
+    ...accepted.session,
+    closed: false,
+    pointBatches: accepted.session.pointBatches + 1,
+    totalPoints: accepted.session.totalPoints + accepted.header.point_count,
+    lastSequence: accepted.header.sequence,
+    lastPoseSequence: accepted.header.pose_sequence,
+    lastSeenAt: accepted.header.timestamp,
+  };
+  const { touchedKeys, pose } = chunkStore.storeAcceptedBatchDurably(accepted, nextSession);
+  sessionStore.commitExternalBatch(accepted);
+  fanOutAccepted(accepted, touchedKeys, pose);
+}
+
+function ingestExternalControl(sessionId: string, message: Record<string, unknown>): void {
+  if (message.type === 'create_session') {
+    const create = { ...(message as unknown as CreateSessionMessage), session_id: sessionId };
+    const session = sessionStore.ensureSession(create);
+    runStorageOperation('persist consumed session', () => chunkStore.syncSession(session));
+    return;
+  }
+  if (message.type === 'close_session') {
+    if (!sessionStore.hasSession(sessionId)) {
+      return;
+    }
+    const session = sessionStore.markClosed(sessionId);
+    runStorageOperation('persist consumed session close', () => {
+      chunkStore.flushSession(sessionId);
+      chunkStore.syncSession(session);
+    });
+    return;
+  }
+  console.error(`iggy: ${sessionId}: ignoring control message of type ${String(message.type)}`);
+}
+
+function startIggyConsumer(): IggyConsumer | undefined {
+  const url = process.env.IGGY_HTTP_URL;
+  if (!url) {
+    return undefined;
+  }
+  const client = new IggyHttpClient({
+    url,
+    username: process.env.IGGY_USERNAME ?? 'iggy',
+    password: process.env.IGGY_PASSWORD ?? 'iggy',
+  });
+  const consumer = new IggyConsumer(
+    client,
+    {
+      stream: process.env.IGGY_STREAM ?? 'pcv',
+      consumer: process.env.IGGY_CONSUMER ?? 'pcv-server',
+      pollMs: parseIntegerEnv(process.env.IGGY_POLL_MS, 100),
+      pageSize: parseIntegerEnv(process.env.IGGY_PAGE_SIZE, 32),
+    },
+    {
+      onControl: (sessionId, message) => {
+        try {
+          ingestExternalControl(sessionId, message);
+        } catch (error) {
+          if (error instanceof StorageOperationError) {
+            throw error;
+          }
+          console.error(`iggy: ${sessionId}: control message rejected: ${getErrorMessage(error)}`);
+        }
+      },
+      onBatch: (sessionId, record) => {
+        if (!sessionStore.hasSession(sessionId)) {
+          console.error(`iggy: ${sessionId}: batch ${record.header.sequence} before create_session; skipped`);
+          return;
+        }
+        try {
+          ingestExternalBatch(sessionId, record);
+        } catch (error) {
+          if (error instanceof DurableBatchError || error instanceof StorageOperationError) {
+            console.error(error.message, error.cause);
+            setImmediate(() => process.exit(1)); // same fail-fast rule as the socket path
+            return;
+          }
+          console.error(`iggy: ${sessionId}: batch ${record.header.sequence} rejected: ${getErrorMessage(error)}`);
+        }
+      },
+      log: (message) => console.log(message),
+    },
+  );
+  consumer
+    .start()
+    .then(() => console.log(`iggy consumer following stream ${process.env.IGGY_STREAM ?? 'pcv'} at ${url}`))
+    .catch((error) => console.error(`iggy consumer failed to start: ${getErrorMessage(error)}`));
+  return consumer;
 }
 
 function configureViewerSocket(
@@ -1126,6 +1233,7 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`Received ${signal}, flushing dirty chunks`);
   clearInterval(liveRefreshTimer);
   clearInterval(checkpointTimer);
+  iggyConsumer?.stop();
   const httpClosed = new Promise<void>((resolve) => server.close(() => resolve()));
   for (const ws of [...ingestWss.clients, ...viewerWss.clients]) {
     ws.close(1001, 'Server shutting down');
@@ -1163,6 +1271,8 @@ const checkpointTimer = setInterval(() => {
     console.error('Checkpoint tick failed', error);
   }
 }, checkpointTickMs);
+
+const iggyConsumer = startIggyConsumer();
 
 server.listen(port, () => {
   console.log(`point-cloud-visualizer listening on http://localhost:${port}`);

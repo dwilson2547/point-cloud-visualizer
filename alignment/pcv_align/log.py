@@ -123,6 +123,15 @@ def matrix_to_pose(matrix: np.ndarray) -> dict:
     }
 
 
+def encode_record(header: dict, payload: bytes) -> bytes:
+    """One batch-log record, framed exactly as the server writes it (and as the Iggy
+    consumer expects a message): magic, header length, payload length, crc32, header
+    JSON, payload."""
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    body = header_bytes + payload
+    return FRAME.pack(LOG_MAGIC, len(header_bytes), len(payload), zlib.crc32(body) & 0xFFFFFFFF) + body
+
+
 def read_log(path: str, *, on_warning=None) -> Iterator[Batch]:
     with open(path, "rb") as handle:
         data = handle.read()

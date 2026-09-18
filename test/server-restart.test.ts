@@ -8,7 +8,7 @@ import test from 'node:test';
 import { WebSocket } from 'ws';
 
 import { POINT_FORMAT, POINT_STRIDE_BYTES } from '../src/protocol.js';
-import { SocketMessages, connect, reservePort, startServer, stopServer } from './helpers.js';
+import { connect, messagesOf, reservePort, startServer, stopServer } from './helpers.js';
 
 test('restores sessions and chunks across restart, then resumes at the persisted sequence', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcv-restart-'));
@@ -20,7 +20,7 @@ test('restores sessions and chunks across restart, then resumes at the persisted
   });
 
   const ingest = await connect(`ws://127.0.0.1:${port}/ws/ingest`);
-  const ingestMessages = new SocketMessages(ingest);
+  const ingestMessages = messagesOf(ingest);
   ingest.send(
     JSON.stringify({
       type: 'create_session',
@@ -54,7 +54,7 @@ test('restores sessions and chunks across restart, then resumes at the persisted
   const viewer = await connect(
     `ws://127.0.0.1:${port}/ws/view?session_id=restart-session`,
   );
-  const viewerMessages = new SocketMessages(viewer);
+  const viewerMessages = messagesOf(viewer);
   const state = await viewerMessages.nextJson();
   assert.equal(state.type, 'viewer_session_state');
   assert.equal(state.last_sequence, 2);
@@ -68,7 +68,7 @@ test('restores sessions and chunks across restart, then resumes at the persisted
   await once(viewer, 'close');
 
   const resumed = await connect(`ws://127.0.0.1:${port}/ws/ingest`);
-  const resumedMessages = new SocketMessages(resumed);
+  const resumedMessages = messagesOf(resumed);
   resumed.send(
     JSON.stringify({
       type: 'resume_session',

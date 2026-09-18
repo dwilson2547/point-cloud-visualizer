@@ -7,7 +7,7 @@ import test from 'node:test';
 
 import { buildFrustum, frustumContainsPoint } from '../src/lod-select.js';
 import { POINT_FORMAT, POINT_STRIDE_BYTES } from '../src/protocol.js';
-import { SocketMessages, connect, reservePort, startServer, stopServer } from './helpers.js';
+import { connect, messagesOf, reservePort, startServer, stopServer } from './helpers.js';
 
 test('frustumContainsPoint accepts points in view and rejects those behind or beside it', () => {
   const frustum = buildFrustum({
@@ -36,7 +36,7 @@ test('the live overlay is culled per viewer to the points in its view, capped, o
   });
 
   const ingest = await connect(`ws://127.0.0.1:${port}/ws/ingest`);
-  const ingestMessages = new SocketMessages(ingest);
+  const ingestMessages = messagesOf(ingest);
   ingest.send(
     JSON.stringify({
       type: 'create_session',
@@ -91,10 +91,10 @@ test('the live overlay is culled per viewer to the points in its view, capped, o
 
   // A plain viewer (no view sent) and an LOD viewer looking down +x from the origin.
   const plain = await connect(`ws://127.0.0.1:${port}/ws/view?session_id=overlay`);
-  const plainMessages = new SocketMessages(plain);
+  const plainMessages = messagesOf(plain);
   assert.equal((await plainMessages.nextJson()).type, 'viewer_session_state');
   const lod = await connect(`ws://127.0.0.1:${port}/ws/view?session_id=overlay&lod=1`);
-  const lodMessages = new SocketMessages(lod);
+  const lodMessages = messagesOf(lod);
   assert.equal((await lodMessages.nextJson()).type, 'viewer_session_state');
   const view = (extra: Record<string, unknown> = {}): void => {
     lod.send(
