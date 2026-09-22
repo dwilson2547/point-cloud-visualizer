@@ -139,7 +139,8 @@ The decisions behind this layout are nodes in [`decisions/`](./decisions/).
 - ~~On-the-fly registration refinement and loop-closure-aware remapping~~ — the watch mode and
   partial re-fusion do this; chunks still re-fuse wholesale after a closure (submaps are the next
   rung, see `alignment.md`)
-- Range-image ingest for "video-like" streaming of spinning lidar (`protocol-v1.md`, deferred)
+- Range-image ingest for "video-like" streaming of spinning lidar — proof of concept measured,
+  still deferred on deskew (`range-image-ingest.md`)
 - Potree-format snapshot export — not built; the Three.js viewer replaced the Potree plan
 
 ## Design questions
