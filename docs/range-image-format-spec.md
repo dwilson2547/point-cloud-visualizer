@@ -11,12 +11,21 @@ A third **point format**, not a third transport. `point_format` is already negot
 records that include it (`decisions/0009`), so one new format reaches **both** inlets with no new
 path. A publisher that never names it is unaffected.
 
-## The frame
+## Two streams per batch, because colour and geometry are not alike
 
-One batch = one spin = one H.264 access unit, Annex-B framed, always an IDR.
+One batch = one spin = **two** H.264 access units, Annex-B framed, both always IDR: a lossless
+*geometry* stream and an optional, lossy *colour* stream.
 
-A spin is a grid of `R` rings × `A` azimuth bins. Three 8-bit planes are stacked vertically into a
-single `A × 3R` luma image:
+Splitting them is the whole design, and it is the same asymmetry the MSB/LSB result exposed. A
+2 mm error in geometry is a wrong measurement; a 2% error in colour is invisible. Coding them
+together forces colour up to lossless — roughly tripling the payload to carry the channel that
+tolerates loss best — and forces geometry down to whatever colour can survive. Kept apart, each
+gets the treatment it wants and colour costs a fraction of geometry.
+
+### Geometry stream (required, lossless)
+
+A grid of `R` rings × `A` azimuth bins, three 8-bit planes stacked vertically into one `A × 3R`
+luma image:
 
 | rows | plane | meaning |
 |---|---|---|
@@ -32,9 +41,42 @@ preserves it exactly.
 
 `3R` is even whenever `R` is, which yuv420p requires: VLP-16 → 1800×48, VLP-32 → 1800×96.
 
+### Colour stream (optional, lossy)
+
+An `A × R` image — one sample per point, same grid, same row order — carrying RGB as ordinary
+`yuv420p`. Unlike geometry this is a *natural image* and should be coded like one: chroma
+subsampling is appropriate (adjacent samples are spatially adjacent points), and a normal quality
+target such as `-crf 20` is fine. Lossy colour cannot corrupt a position, which is the point of
+keeping it in its own stream.
+
+`R` must be even for yuv420p; for an odd ring count pad one duplicate row and drop it on decode.
+
+Colour is **optional and absent by default**: a bare VLP-16 has none. When the stream is absent the
+server does what `xyzi_q4_v2` does today and fuses grey from intensity, so nothing downstream
+changes. When present, it lands directly in the `r`, `g`, `b` bytes the internal 18-byte layout
+already carries — colour is not a new concept anywhere past the ingest boundary, it is only the
+current quantised ingest format that drops it.
+
+Sources are a paired camera or a colourising sensor, so this stays specced-but-unbuilt until there
+is one on the rig.
+
+### Payload container
+
+The batch payload is the two access units with a small fixed header, so one binary frame still
+carries one batch:
+
+| offset | field |
+|---|---|
+| 0 | magic `RIV1` (4 B) |
+| 4 | `geometry_bytes` u32le |
+| 8 | `colour_bytes` u32le — `0` when absent |
+| 12 | geometry access unit |
+| … | colour access unit |
+
 ### Encoder settings (non-negotiable parts of the format)
 
-- `-qp 0` (lossless), `-pix_fmt yuvj420p`, `-g 1`, `-bf 0`.
+- Geometry: `-qp 0` (lossless), `-pix_fmt yuvj420p`, `-g 1`, `-bf 0`.
+- Colour: `-crf 20` (tunable), `-pix_fmt yuv420p`, `-g 1`, `-bf 0` — lossy on purpose.
 - **yuvj420p, not gray**: ffmpeg silently substitutes `yuv420p` for `gray` where libx264 lacks
   i400, and the limited-range 16–235 squeeze corrupts range by metres. See
   [`notes/ffmpeg-silently-swaps-gray-for-yuv420p-and-corrupts-range-da.md`](./notes/ffmpeg-silently-swaps-gray-for-yuv420p-and-corrupts-range-da.md).
@@ -62,7 +104,13 @@ The grid is constant for a session, so it does **not** belong in the per-batch h
     "distance_scale_m": 0.002,
     "elevations_deg": [-15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15],
     "codec": "h264",
-    "plane_layout": "msb_lsb_intensity"
+    "plane_layout": "msb_lsb_intensity",
+    "colour": {
+      "present": false,
+      "codec": "h264",
+      "pix_fmt": "yuv420p",
+      "source": "none"
+    }
   }
 }
 ```
@@ -90,6 +138,9 @@ fall back to `xyzi_q4_v2` at session start.
   a mismatch is an `error`, not a silent accept.
 - `compression: "none"` — the codec *is* the compression; permessage-deflate must **not** be
   applied on top (it will expand an already-entropy-coded payload).
+- Whether a colour stream is present is session-scoped (`sensor_profile.colour.present`), but
+  `colour_bytes == 0` in the container is always legal, so a publisher may drop colour for
+  individual spins (dropped camera frame, exposure change) without renegotiating.
 - `bounds_local` is computed server-side after decode rather than sent, since the publisher would
   have to project the whole grid to produce it.
 
@@ -127,6 +178,8 @@ same 18-byte rows they see today.
 4. Encoder in the publishers: straightforward in the Python KISS-ICP client, a new dependency in
    the TypeScript VLP-16/32 clients.
 5. Gate `ingestStride()` callers, then wire the decode boundary.
+6. Colour last, and only once a colour source exists on the rig — the container reserves room for
+   it so adding it later is not a format break.
 
 ## Open question this does not settle
 
