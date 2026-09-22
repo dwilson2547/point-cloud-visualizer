@@ -193,6 +193,7 @@ interface Result {
   maxErrM: number;
   lostPoints: number;
   decodable: string;
+  profile: string;
 }
 
 // Encode a plane sequence, decode it back, and report both size and the error it
@@ -248,6 +249,14 @@ function runCodec(
       if (e > maxErr) maxErr = e;
     }
   }
+  // The H.264 profile decides whether a hardware decoder will touch this at all:
+  // lossless (-qp 0) forces High 4:4:4, which most hardware blocks refuse.
+  let profile = '-';
+  try {
+    profile = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=profile', '-of', 'csv=p=0', outFile])
+      .toString().trim().split('\n')[0] || '-';
+  } catch { /* ffprobe is best-effort here */ }
+
   return {
     name,
     bytes: fs.statSync(outFile).size,
@@ -256,6 +265,7 @@ function runCodec(
     maxErrM: maxErr,
     lostPoints: lost,
     decodable,
+    profile,
   };
 }
 
@@ -321,12 +331,33 @@ function main(): void {
       ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuvj420p'], 'mp4', 'WebCodecs (hw)',
       (b, i) => Math.round((b[i] / 255) * MAX_RANGE_8 / DISTANCE_SCALE_M), truth));
 
+    // The store voxel-fuses at 4 cm, so range error below ~40 mm is invisible after
+    // fusion. This is the only config that is both hardware-decodable (plain High)
+    // and bounded inside that voxel — MAX_RANGE_8 sets the quantiser step.
+    results.push(runCodec('x264-8bit-qp1-High', g8, 'gray', W, H,
+      ['-c:v', 'libx264', '-preset', 'veryfast', '-qp', '1', '-pix_fmt', 'yuvj420p', '-bf', '0'], 'mp4', 'WebCodecs (hw)',
+      (b, i) => Math.round((b[i] / 255) * MAX_RANGE_8 / DISTANCE_SCALE_M), truth));
+
     results.push(runCodec('x265-8bit-lossless', g8, 'gray', W, H,
       ['-c:v', 'libx265', '-preset', 'veryfast', '-x265-params', 'lossless=1', '-pix_fmt', 'gray'], 'mp4', 'WebCodecs (HEVC, patchy)',
       (b, i) => Math.round((b[i] / 255) * MAX_RANGE_8 / DISTANCE_SCALE_M), truth));
 
     results.push(runCodec('x264-msb-lsb-lossless', split, 'gray', W, H * 2,
       ['-c:v', 'libx264', '-preset', 'veryfast', '-qp', '0', '-pix_fmt', 'yuvj420p'], 'mp4', 'WebCodecs (hw)',
+      (b, i) => {
+        const perFrame = RINGS * AZIMUTH_BINS;
+        const f = Math.floor(i / perFrame);
+        const j = i % perFrame;
+        const base = f * perFrame * 2;
+        return (b[base + j] << 8) | b[base + perFrame + j];
+      }, truth));
+
+    // qp=1 drops out of High 4:4:4 into plain High, which hardware decoders do
+    // support — but it is no longer exact. The asymmetry matters: one step of MSB
+    // error is 512 mm, one step of LSB error is 2 mm, so this measures whether the
+    // MSB plane survives intact in a profile a GPU will actually decode.
+    results.push(runCodec('x264-msb-lsb-qp1-High', split, 'gray', W, H * 2,
+      ['-c:v', 'libx264', '-preset', 'veryfast', '-qp', '1', '-pix_fmt', 'yuvj420p', '-bf', '0'], 'mp4', 'WebCodecs (hw)',
       (b, i) => {
         const perFrame = RINGS * AZIMUTH_BINS;
         const f = Math.floor(i / perFrame);
@@ -355,20 +386,76 @@ function main(): void {
 
     const baseline = (globalThis as Record<string, unknown>).__baseline as number;
     console.log(`ROW ORDER: ${label}`);
-    console.log('  codec                       bytes/spin  vs base    RMSE   max err   lost   enc/spin  decode');
+    console.log('  codec                       bytes/spin  vs base    RMSE   max err   lost   enc/spin  h264 profile');
     for (const r of results) {
       const perSpin = r.bytes / SPINS;
       const ratio = baseline / perSpin;
       console.log(
         `  ${r.name.padEnd(25)} ${fmt(perSpin).padStart(10)} ${(ratio.toFixed(2) + '×').padStart(7)}` +
         ` ${(r.rmseM * 1000).toFixed(1).padStart(7)}mm ${(r.maxErrM * 1000).toFixed(0).padStart(6)}mm` +
-        ` ${String(r.lostPoints).padStart(6)} ${(r.encodeMs / SPINS).toFixed(1).padStart(8)}ms  ${r.decodable}`,
+        ` ${String(r.lostPoints).padStart(6)} ${(r.encodeMs / SPINS).toFixed(1).padStart(8)}ms  ${r.profile}`,
       );
     }
     console.log();
   }
 
+  if (process.env.EXPORT_DIR) {
+    exportStream(process.env.EXPORT_DIR, elevationSorted);
+  }
   fs.rmSync(TMP, { recursive: true, force: true });
+}
+
+// Emit the winning config (MSB/LSB lossless, elevation-sorted) as a raw Annex-B
+// H.264 elementary stream plus a geometry sidecar, for the WebCodecs viewer demo.
+// Annex-B on purpose: start-code framing can be split in a few lines of JS, where
+// an mp4 would need a demuxer before VideoDecoder could be fed at all.
+function exportStream(dir: string, rowOrderDeg: number[]): void {
+  fs.mkdirSync(dir, { recursive: true });
+  const spins = Array.from({ length: SPINS }, (_, s) => renderSpin(s, rowOrderDeg));
+  const MAX_RANGE_8 = 20; // metres; halved from the table run so the quantiser step
+                          // (78 mm at 40 m) lands inside the 4 cm fusion voxel.
+
+  const g8 = Buffer.alloc(spins.length * RINGS * AZIMUTH_BINS);
+  for (let f = 0; f < spins.length; f++) {
+    const r = spins[f].range;
+    for (let i = 0; i < r.length; i++) {
+      const metres = r[i] * DISTANCE_SCALE_M;
+      g8[f * r.length + i] = r[i] === 0 ? 0 : Math.max(1, Math.min(255, Math.round((metres / MAX_RANGE_8) * 255)));
+    }
+  }
+  const rawFile = path.join(TMP, 'export8.raw');
+  fs.writeFileSync(rawFile, g8);
+
+  // Two streams, because the open question is which profile a browser will accept:
+  // qp0 is exact (only 8-bit quantisation error) but High 4:4:4; qp1 is plain High,
+  // which hardware decodes, at the cost of codec error on top.
+  const variants = [
+    { file: 'range-qp0.h264', args: ['-qp', '0'] },
+    { file: 'range-qp1.h264', args: ['-qp', '1'] },
+  ];
+  for (const v of variants) {
+    ffmpeg([
+      '-f', 'rawvideo', '-pix_fmt', 'gray', '-s', `${AZIMUTH_BINS}x${RINGS}`, '-r', '10', '-i', rawFile,
+      '-c:v', 'libx264', '-preset', 'veryfast', ...v.args, '-pix_fmt', 'yuvj420p',
+      '-g', '1', '-bf', '0', // every spin an IDR keyframe: the viewer can join anywhere
+      '-f', 'h264', path.join(dir, v.file),
+    ]);
+  }
+
+  fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({
+    rings: RINGS,
+    azimuthBins: AZIMUTH_BINS,
+    spins: SPINS,
+    maxRangeM: MAX_RANGE_8,
+    elevationsDeg: rowOrderDeg,
+    layout: 'gray8-range',
+    poses: Array.from({ length: SPINS }, (_, s) => sensorPose(s)),
+    baselineBytesPerSpin: Math.round(baselineQ4Bytes(spins, rowOrderDeg).deflated / SPINS),
+    streams: variants.map((v) => ({ file: v.file, bytes: fs.statSync(path.join(dir, v.file)).size })),
+  }, null, 2));
+  for (const v of variants) {
+    console.log(`exported ${v.file}: ${fmt(fs.statSync(path.join(dir, v.file)).size / SPINS)}/spin`);
+  }
 }
 
 function fmt(bytes: number): string {

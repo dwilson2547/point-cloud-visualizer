@@ -150,3 +150,6 @@ data/
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Spike: regenerate with EXPORT_DIR=public/spike npx tsx scripts/spike-range-image.ts
+public/spike/

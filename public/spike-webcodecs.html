@@ -1,0 +1,167 @@
+<!doctype html>
+<!-- SPIKE (throwaway): decode a lidar range image with WebCodecs and render it.
+     The question this page exists to answer is not "does it look right" but
+     "which H.264 profile will this browser's VideoDecoder actually accept" —
+     exact range coding needs High 4:4:4, which hardware decoders usually refuse. -->
+<meta charset="utf-8">
+<title>Range-image WebCodecs spike</title>
+<style>
+  body { margin: 0; background: #0b0d10; color: #d7dde5; font: 13px/1.5 ui-monospace, monospace; }
+  #hud { position: fixed; top: 0; left: 0; padding: 10px 14px; background: #0b0d10e0; z-index: 10; }
+  #hud b { color: #7fd4ff; }
+  .ok { color: #7bd88f; } .bad { color: #ff6b6b; } .warn { color: #ffc86b; }
+  table { border-collapse: collapse; margin-top: 6px; }
+  td { padding: 1px 10px 1px 0; }
+</style>
+<div id="hud">loading…</div>
+<!-- OrbitControls imports a bare "three" specifier, same as index.html. -->
+<script type="importmap">
+  { "imports": { "three": "./vendor/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from './vendor/three.module.js';
+import { OrbitControls } from './vendor/OrbitControls.js';
+
+const hud = document.getElementById('hud');
+const log = [];
+function render() { hud.innerHTML = log.join('<br>'); }
+function say(s) { log.push(s); render(); }
+
+// ---- Annex-B splitting. Access units start at an SPS (NAL type 7); x264 emits a
+// mix of 3- and 4-byte start codes, so both have to be handled.
+function splitAccessUnits(bytes) {
+  // Test the 4-byte code FIRST and step past whatever matched. Scanning byte by byte
+  // double-counts: 00 00 00 01 also matches the 3-byte 00 00 01 at offset+1, which
+  // silently yields a 1-byte leading "access unit" with no keyframe in it.
+  const starts = [];
+  for (let i = 0; i + 3 < bytes.length;) {
+    if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 0 && bytes[i + 3] === 1) {
+      starts.push({ at: i, hdr: 4 }); i += 4;
+    } else if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
+      starts.push({ at: i, hdr: 3 }); i += 3;
+    } else i++;
+  }
+  const units = [];
+  for (let k = 0; k < starts.length; k++) {
+    const { at, hdr } = starts[k];
+    const end = k + 1 < starts.length ? starts[k + 1].at : bytes.length;
+    units.push({ type: bytes[at + hdr] & 0x1f, at, end, hdr });
+  }
+  const aus = [];
+  let cur = null;
+  for (const u of units) {
+    if (u.type === 7 && cur) { aus.push(bytes.subarray(cur.at, u.at)); cur = null; }
+    if (!cur) cur = { at: u.at };
+  }
+  if (cur) aus.push(bytes.subarray(cur.at, bytes.length));
+  return { aus, sps: units.find((u) => u.type === 7) };
+}
+
+// avc1.PPCCLL from the SPS payload: profile_idc, constraint flags, level_idc.
+function codecString(bytes, sps) {
+  const p = sps.at + sps.hdr + 1;
+  const hex = (n) => n.toString(16).padStart(2, '0');
+  return `avc1.${hex(bytes[p])}${hex(bytes[p + 1])}${hex(bytes[p + 2])}`;
+}
+
+const meta = await (await fetch('./spike/meta.json')).json();
+say(`<b>range image</b> ${meta.rings}×${meta.azimuthBins}, ${meta.spins} spins, max ${meta.maxRangeM} m`);
+say(`<b>baseline</b> xyzi_q4_v2 + deflate = ${(meta.baselineBytesPerSpin / 1024).toFixed(1)} KB/spin`);
+
+// ---- Probe both profiles before decoding anything.
+const probes = [];
+for (const s of meta.streams) {
+  const buf = new Uint8Array(await (await fetch(`./spike/${s.file}`)).arrayBuffer());
+  const { aus, sps } = splitAccessUnits(buf);
+  const codec = codecString(buf, sps);
+  let support = { supported: false };
+  try {
+    support = await VideoDecoder.isConfigSupported({ codec, codedWidth: meta.azimuthBins, codedHeight: meta.rings });
+  } catch (e) { support = { supported: false, error: e.message }; }
+  probes.push({ ...s, aus, codec, support });
+  const cls = support.supported ? 'ok' : 'bad';
+  say(`<b>${s.file}</b> ${codec} — <span class="${cls}">${support.supported ? 'SUPPORTED' : 'REFUSED'}</span>` +
+      ` · ${(s.bytes / meta.spins / 1024).toFixed(1)} KB/spin · ${(meta.baselineBytesPerSpin / (s.bytes / meta.spins)).toFixed(1)}× vs baseline`);
+}
+
+const chosen = probes.find((p) => p.support.supported);
+if (!chosen) { say('<span class="bad">no stream is decodable here — spike answer is "software decode required"</span>'); }
+
+// ---- three.js scene
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 500);
+camera.position.set(9, 9, 6);
+const controls = new OrbitControls(camera, renderer.domElement);
+const CAP = meta.rings * meta.azimuthBins;
+const positions = new Float32Array(CAP * 3);
+const colors = new Float32Array(CAP * 3);
+const geom = new THREE.BufferGeometry();
+geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+scene.add(new THREE.Points(geom, new THREE.PointsMaterial({ size: 0.035, vertexColors: true })));
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+// Rebuild cartesian points from the decoded Y plane. This is the step that makes the
+// whole idea work: the decoder hands back exactly the (ring, azimuth) grid the sensor
+// produced, so reconstruction is a table lookup per pixel, no per-point metadata.
+const elev = meta.elevationsDeg.map((d) => (d * Math.PI) / 180);
+function rebuild(y, spin) {
+  const pose = meta.poses[spin] ?? { origin: [0, 0, 0], yaw: 0 };
+  let n = 0;
+  for (let r = 0; r < meta.rings; r++) {
+    const ce = Math.cos(elev[r]); const se = Math.sin(elev[r]);
+    for (let c = 0; c < meta.azimuthBins; c++) {
+      const v = y[r * meta.azimuthBins + c];
+      if (v === 0) continue; // no return
+      const dist = (v / 255) * meta.maxRangeM;
+      const az = (c / meta.azimuthBins) * 2 * Math.PI + pose.yaw;
+      const xy = dist * ce;
+      positions[n * 3] = xy * Math.cos(az) + pose.origin[0];
+      positions[n * 3 + 1] = xy * Math.sin(az) + pose.origin[1];
+      positions[n * 3 + 2] = dist * se + pose.origin[2];
+      const g = 0.35 + 0.65 * (1 - dist / meta.maxRangeM);
+      colors[n * 3] = g * 0.6; colors[n * 3 + 1] = g; colors[n * 3 + 2] = 1.0;
+      n++;
+    }
+  }
+  geom.setDrawRange(0, n);
+  geom.attributes.position.needsUpdate = true;
+  geom.attributes.color.needsUpdate = true;
+  return n;
+}
+
+if (chosen) {
+  let decoded = 0; let totalMs = 0; let submitted = 0;
+  const times = new Map();
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      const t0 = times.get(frame.timestamp); if (t0 !== undefined) { totalMs += performance.now() - t0; times.delete(frame.timestamp); }
+      const size = frame.allocationSize();
+      const buf = new Uint8Array(size);
+      frame.copyTo(buf).then(() => {
+        // I420: the Y plane is first and full resolution — that is our range image.
+        rebuild(buf.subarray(0, meta.rings * meta.azimuthBins), decoded % meta.spins);
+        frame.close();
+        decoded++;
+        if (decoded === submitted) {
+          say(`<b>decoded</b> <span class="ok">${decoded}/${chosen.aus.length} frames</span>, ` +
+              `mean ${(totalMs / decoded).toFixed(2)} ms/spin · ${(1000 / (totalMs / decoded)).toFixed(0)} spins/s headroom`);
+          say(`<span class="ok">verdict:</span> ${chosen.codec} decodes here; reconstruction is a per-pixel table lookup`);
+        }
+      });
+    },
+    error: (e) => say(`<span class="bad">decoder error: ${e.message}</span>`),
+  });
+  decoder.configure({ codec: chosen.codec, codedWidth: meta.azimuthBins, codedHeight: meta.rings, optimizeForLatency: true });
+  chosen.aus.forEach((au, i) => {
+    const ts = i * 100000;
+    times.set(ts, performance.now());
+    submitted++;
+    decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: ts, data: au }));
+  });
+  await decoder.flush();
+}
+</script>
