@@ -132,8 +132,8 @@ Three, each of which produced a confident wrong answer first:
 
 1. Measure on a real captured spin sequence, with deskew, before anything else. Until then the
    ratios are a lower bound on difficulty, not an upper bound on payoff.
-2. If it survives that, the smallest useful increment is a `range_image_v1` ingest format
-   negotiated the same way `xyzi_q4_v2` is (`point_format` in the batch header), decoded to the
-   internal 18-byte layout at the ingest boundary like every other format in
-   [`src/point-formats.ts`](../src/point-formats.ts) — no change to fusion, store or serve.
+2. If it survives that, the shape of the change is specced in
+   [`range-image-format-spec.md`](./range-image-format-spec.md) — `range_h264_v1` as a third
+   negotiated `point_format`, decoded at the ingest boundary, with fusion, store and serve
+   untouched.
 3. The lossy-before-the-log question needs answering first, since it conflicts with `0002`.
