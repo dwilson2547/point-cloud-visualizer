@@ -91,6 +91,8 @@ A TypeScript server (`src/`), a Three.js viewer (`public/`), Velodyne and synthe
 - a live overlay culled per viewer to the points inside its view, with an opt-out and a per-batch
   cap for slow links (viewer controls: overlay, max pts)
 - an observation filter at serve time (viewer controls: min hits, min ratio)
+- round splats sized from each chunk's LOD voxel spacing (`spacing_m` on `chunk_lod`/`chunk_delta`)
+  plus an eye-dome lighting pass, Potree-style (viewer controls: size, edl, str)
 
 The write path appends each raw batch to the session log, then partitions its points into fixed
 world chunks and fuses them into bounded voxel representatives in memory. Chunk files are rewritten

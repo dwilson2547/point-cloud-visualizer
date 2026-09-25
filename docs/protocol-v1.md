@@ -341,8 +341,9 @@ and `chunk_delta`):
 - `chunk_update` — one accepted batch in the publisher's wire format, local frame, with the pose
   it was fused with (corrected if corrections are installed). For an LOD viewer it is culled per
   point to the viewer's frustum and decimated to its cap; a batch with nothing in view is not sent.
-- `chunk_lod { chunk_key, level, version, point_count, point_format, stride_bytes, origin?,
-  quantum? }` — a keyframe: replace this chunk with these points at this level.
+- `chunk_lod { chunk_key, level, spacing_m, version, point_count, point_format, stride_bytes,
+  origin?, quantum? }` — a keyframe: replace this chunk with these points at this level.
+  `spacing_m` is the level's voxel edge in metres; the viewer sizes each chunk's splats from it.
 - `chunk_delta { … same fields … }` — append these points to the chunk the viewer holds.
 - `chunk_drop { chunk_key }` — the chunk left the view; free it.
 - `session_rebuilt { batches, chunks }` — pose corrections changed; drop everything and re-request.

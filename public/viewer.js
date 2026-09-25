@@ -24,8 +24,12 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 app.appendChild(renderer.domElement);
 
+// Points and helpers live in separate scenes: with EDL on, points render into an
+// offscreen target whose alpha carries depth, and helpers are drawn afterwards against
+// the depth the EDL pass restores. No scene.background — it would fill that alpha.
+const BACKGROUND = new THREE.Color(0x0b0e13);
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0e13);
+const helperScene = new THREE.Scene();
 
 const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.05, 5000);
 camera.up.set(0, 0, 1); // lidar data is Z-up
@@ -38,12 +42,174 @@ controls.dampingFactor = 0.08;
 // Reference grid on the XY plane + world axes.
 const grid = new THREE.GridHelper(40, 40, 0x2a3550, 0x18202f);
 grid.rotation.x = Math.PI / 2;
-scene.add(grid);
-scene.add(new THREE.AxesHelper(1));
+helperScene.add(grid);
+helperScene.add(new THREE.AxesHelper(1));
 
-// Fixed screen-space point size (no distance attenuation) keeps fill cost flat and
-// bounded regardless of camera distance. Shared by the overlay and every base chunk.
-const material = new THREE.PointsMaterial({ size: 2.0, sizeAttenuation: false, vertexColors: true });
+// ------------------------------------------------------------ splat material
+// Round splats sized in world units from the served LOD spacing: a chunk at level L
+// carries points on a spacing_m grid, so a disc of ~1.4 × spacing (the cell diagonal)
+// closes the surface at any distance without over-painting. The server already picks
+// the level so that spacing projects to a few pixels; min/max px clamp the extremes.
+// spacing 0 means "no known spacing" (the raw live overlay) → a fixed pixel size.
+// Colour is written as-is (the u8 values are already display sRGB) and alpha carries
+// log2 view depth for the EDL pass; 0 alpha means "no point here".
+const splatUniforms = {
+  uProjScale: { value: 1 }, // drawing-buffer px per metre at 1 m depth
+  uScale: { value: 1.4 },
+  uMinPx: { value: 1.5 },
+  uMaxPx: { value: 48 },
+  uFixedPx: { value: 2 },
+};
+const SPLAT_VERTEX = /* glsl */ `
+  uniform float uProjScale, uScale, uMinPx, uMaxPx, uFixedPx, uSpacing;
+  attribute vec3 color;
+  varying vec3 vColor;
+  varying float vLogDepth;
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+    float depth = max(-mv.z, 1e-4);
+    gl_PointSize = uSpacing > 0.0
+      ? clamp(uScale * uSpacing * uProjScale / depth, uMinPx, uMaxPx)
+      : uFixedPx;
+    vColor = color;
+    vLogDepth = log2(depth) + 16.0; // > 0 for any depth past 15 µm
+  }
+`;
+const SPLAT_FRAGMENT = /* glsl */ `
+  varying vec3 vColor;
+  varying float vLogDepth;
+  void main() {
+    vec2 c = gl_PointCoord * 2.0 - 1.0;
+    if (dot(c, c) > 1.0) discard;
+    gl_FragColor = vec4(vColor, vLogDepth);
+  }
+`;
+const splatMaterials = new Map(); // spacing_m -> material; uniforms shared by reference
+function splatMaterial(spacing) {
+  let material = splatMaterials.get(spacing);
+  if (!material) {
+    material = new THREE.ShaderMaterial({
+      uniforms: { ...splatUniforms, uSpacing: { value: spacing } },
+      vertexShader: SPLAT_VERTEX,
+      fragmentShader: SPLAT_FRAGMENT,
+    });
+    splatMaterials.set(spacing, material);
+  }
+  return material;
+}
+
+function updateProjScale() {
+  const heightPx = renderer.getDrawingBufferSize(new THREE.Vector2()).y;
+  splatUniforms.uProjScale.value = heightPx / (2 * Math.tan((camera.fov * Math.PI) / 360));
+}
+updateProjScale();
+
+// ------------------------------------------------------- eye-dome lighting
+// Potree's EDL: shade each pixel by how much nearer it is than its neighbours in log
+// depth, which outlines silhouettes and brings out surface relief without normals.
+// Points render into a float target (colour + log depth in alpha, plus a depth
+// texture); a full-screen pass shades and composites it, writing the stored depth
+// back so helpers drawn afterwards are occluded correctly.
+const edl = {
+  enabled: false,
+  target: null,
+  material: new THREE.ShaderMaterial({
+    uniforms: {
+      tColor: { value: null },
+      tDepth: { value: null },
+      uTexel: { value: new THREE.Vector2() },
+      uRadius: { value: 1.4 },
+      uStrength: { value: 1.0 },
+      uBackground: { value: BACKGROUND },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D tColor, tDepth;
+      uniform vec2 uTexel;
+      uniform float uRadius, uStrength;
+      uniform vec3 uBackground;
+      varying vec2 vUv;
+      const vec2 NEIGHBOURS[8] = vec2[8](
+        vec2(1.0, 0.0), vec2(0.7071, 0.7071), vec2(0.0, 1.0), vec2(-0.7071, 0.7071),
+        vec2(-1.0, 0.0), vec2(-0.7071, -0.7071), vec2(0.0, -1.0), vec2(0.7071, -0.7071));
+      void main() {
+        vec4 centre = texture2D(tColor, vUv);
+        float sum = 0.0;
+        for (int i = 0; i < 8; i++) {
+          float d = texture2D(tColor, vUv + NEIGHBOURS[i] * uRadius * uTexel).a;
+          if (d > 0.0) sum += centre.a > 0.0 ? max(0.0, centre.a - d) : 100.0;
+        }
+        float shade = exp(-(sum / 8.0) * 300.0 * uStrength);
+        if (centre.a > 0.0) {
+          gl_FragColor = vec4(centre.rgb * shade, 1.0);
+          gl_FragDepth = texture2D(tDepth, vUv).r;
+        } else {
+          if (sum == 0.0) discard; // open background: leave the clear colour
+          gl_FragColor = vec4(uBackground * shade, 1.0); // silhouette halo
+          gl_FragDepth = 1.0;
+        }
+      }
+    `,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.AlwaysDepth,
+  }),
+};
+const edlQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), edl.material);
+edlQuad.frustumCulled = false;
+const edlScene = new THREE.Scene();
+edlScene.add(edlQuad);
+const edlCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+// Float colour targets need EXT_color_buffer_float (near-universal on desktop WebGL2);
+// without it EDL stays off and points render straight to the canvas.
+const edlSupported = renderer.extensions.has('EXT_color_buffer_float');
+
+function resizeEdlTarget() {
+  if (!edl.target) return;
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  edl.target.setSize(size.x, size.y);
+  edl.material.uniforms.uTexel.value.set(1 / size.x, 1 / size.y);
+}
+
+function setEdl(enabled) {
+  edl.enabled = enabled && edlSupported;
+  if (edl.enabled && !edl.target) {
+    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    edl.target = new THREE.WebGLRenderTarget(size.x, size.y, {
+      type: THREE.FloatType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthTexture: new THREE.DepthTexture(size.x, size.y),
+    });
+    edl.material.uniforms.tColor.value = edl.target.texture;
+    edl.material.uniforms.tDepth.value = edl.target.depthTexture;
+    resizeEdlTarget();
+  }
+}
+
+function render() {
+  renderer.autoClear = false;
+  if (edl.enabled) {
+    renderer.setRenderTarget(edl.target);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear();
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    renderer.setClearColor(BACKGROUND, 1);
+    renderer.clear();
+    renderer.render(edlScene, edlCamera);
+  } else {
+    renderer.setClearColor(BACKGROUND, 1);
+    renderer.clear();
+    renderer.render(scene, camera);
+  }
+  renderer.render(helperScene, camera);
+}
 
 const bounds = new THREE.Box3().makeEmpty();
 
@@ -58,7 +224,7 @@ overlayColAttr.setUsage(THREE.DynamicDrawUsage);
 overlayGeometry.setAttribute('position', overlayPosAttr);
 overlayGeometry.setAttribute('color', overlayColAttr);
 overlayGeometry.setDrawRange(0, 0);
-const overlay = new THREE.Points(overlayGeometry, material);
+const overlay = new THREE.Points(overlayGeometry, splatMaterial(0));
 overlay.frustumCulled = false; // spans the whole world; culled manually
 scene.add(overlay);
 
@@ -211,7 +377,7 @@ function ingestBaseChunk(header, buffer) {
   disposeBaseChunk(header.chunk_key);
   const capacity = Math.max(64, Math.ceil(count * 1.5));
   const entry = {
-    points: new THREE.Points(new THREE.BufferGeometry(), material),
+    points: new THREE.Points(new THREE.BufferGeometry(), splatMaterial(header.spacing_m ?? 0)),
     positions: new Float32Array(capacity * 3),
     colors: new Uint8Array(capacity * 3),
     count,
@@ -429,7 +595,7 @@ function animate() {
     recenter();
   }
   controls.update();
-  renderer.render(scene, camera);
+  render();
   if (overlayDirty) {
     overlayPosAttr.clearUpdateRanges();
     overlayColAttr.clearUpdateRanges();
@@ -446,6 +612,8 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  updateProjScale();
+  resizeEdlTarget();
   viewDirty = true;
 });
 
@@ -457,6 +625,24 @@ document.getElementById('connect').addEventListener('click', () => {
   connect(sessionInput.value.trim());
 });
 document.getElementById('recenter').addEventListener('click', recenter);
+const splatScaleInput = document.getElementById('splat-scale');
+const edlInput = document.getElementById('edl');
+const edlStrengthInput = document.getElementById('edl-strength');
+function applyRenderControls() {
+  splatUniforms.uScale.value = Math.max(0.1, Number.parseFloat(splatScaleInput.value) || 1.4);
+  edl.material.uniforms.uStrength.value = Math.max(0, Number.parseFloat(edlStrengthInput.value) || 0);
+  setEdl(edlInput.checked);
+  if (edlInput.checked && !edlSupported) {
+    edlInput.checked = false;
+    edlInput.disabled = true;
+    edlInput.title = 'EDL needs float render targets (EXT_color_buffer_float)';
+  }
+}
+for (const input of [splatScaleInput, edlInput, edlStrengthInput]) {
+  input.addEventListener('input', applyRenderControls);
+}
+applyRenderControls();
+
 for (const input of [els.minHits, els.minRatio, els.overlay, els.overlayMax]) {
   input.addEventListener('change', () => {
     viewDirty = true; // next view update carries the new filter; the server re-sends

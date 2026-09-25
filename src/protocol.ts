@@ -189,6 +189,9 @@ export interface ChunkLodMessage {
   session_id: string;
   chunk_key: string;
   level: number;
+  // Voxel edge length at this level, metres: the spacing of the served points, which the
+  // viewer uses to size splats so neighbouring points close the surface.
+  spacing_m: number;
   // The chunk's fine voxel count this keyframe reflects; deltas continue from it.
   version: number;
   point_count: number;
@@ -208,6 +211,7 @@ export interface ChunkDeltaMessage {
   session_id: string;
   chunk_key: string;
   level: number;
+  spacing_m: number;
   version: number;
   point_count: number;
   point_format: string;

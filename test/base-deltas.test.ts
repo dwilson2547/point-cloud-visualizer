@@ -105,6 +105,7 @@ test('a viewer receives a keyframe, then only the added voxels as deltas', async
   assert.equal(keyframe.type, 'chunk_lod');
   assert.equal(keyframe.point_count, 2);
   assert.equal(keyframe.version, 2);
+  assert.ok((keyframe.spacing_m as number) > 0, 'keyframe carries its level spacing');
   assert.equal(Buffer.from((await viewerMessages.next()).data as ArrayBuffer).byteLength, 2 * POINT_STRIDE_BYTES);
 
   // One new voxel plus a repeat hit: the refresh tick sends a delta of exactly one point.
@@ -113,6 +114,7 @@ test('a viewer receives a keyframe, then only the added voxels as deltas', async
   assert.equal(delta.type, 'chunk_delta', JSON.stringify(delta));
   assert.equal(delta.point_count, 1);
   assert.equal(delta.version, 3);
+  assert.equal(delta.spacing_m, keyframe.spacing_m, 'a delta continues the keyframe level');
   const deltaPayload = Buffer.from((await viewerMessages.next()).data as ArrayBuffer);
   assert.equal(deltaPayload.byteLength, POINT_STRIDE_BYTES);
   assert.ok(Math.abs(deltaPayload.readFloatLE(0) - 0.3) < 1e-6);
